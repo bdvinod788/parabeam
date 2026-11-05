@@ -1,0 +1,6 @@
+numpy
+pyyaml
+httpx
+datasets
+math-verify
+pytest

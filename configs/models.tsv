@@ -1,0 +1,5 @@
+# name	repo	revision	role
+generator	Qwen/Qwen2.5-Math-1.5B-Instruct	aafeb0fc6f22cbf0eaeed126eff8be45b0360a35	required
+prm-7b	Qwen/Qwen2.5-Math-PRM-7B	0610740060112df12585d00a1c5f4624d2f59051	required
+prm-1.5b-kingsleykim	kingsleykim/Qwen2.5-Math-PRM-1.5B	e7f1922ab862cf6e4692eb3a08def89fdd94e774	fallback
+prm-1.5b-hfh4	HuggingFaceH4/Qwen2.5-Math-1.5B-Instruct-PRM-0.2	bc44d4a24bf1f7453fc3892dec25c4669e54ede5	fallback

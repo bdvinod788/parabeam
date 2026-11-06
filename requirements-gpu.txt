@@ -1,2 +1,13 @@
-vllm
-mpi4py
+# Pinned for the whole project. Installed on CARC by scripts/setup_env.sh.
+#
+# vLLM 0.32.0+cu129 and torch 2.13.0+cu129 are the newest pair with a CUDA 12.9
+# build. vLLM 0.33 needs torch 2.14, which has no cu129 wheel, and CUDA 13 needs
+# an R580+ NVIDIA driver that Discovery may not have. If this file changes,
+# rebuild the environment and regenerate configs/requirements-carc.lock.
+--extra-index-url https://download.pytorch.org/whl/cu129
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl
+torch==2.13.0+cu129
+
+# Built from source so it links the openmpi module, not a bundled MPI.
+--no-binary mpi4py
+mpi4py==4.1.2

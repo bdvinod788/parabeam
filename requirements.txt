@@ -1,6 +1,6 @@
 numpy
 pyyaml
 httpx
-datasets
-math-verify
+datasets>=4
+math-verify[antlr4_13_2]
 pytest

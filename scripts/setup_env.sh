@@ -13,10 +13,13 @@ fi
 
 mkdir -p "$repo/logs" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$PB_SCRATCH/tmp"
 export TMPDIR="$PB_SCRATCH/tmp"
+pb_login_limits
 
 if [[ ! -x "$PB_ENV/bin/python" ]]; then
+    rm -rf "$PB_ENV"  # leftovers from an interrupted create
     pb_modules conda
-    mamba create --yes --prefix "$PB_ENV" "python=$PB_PYTHON_VERSION" pip
+    # shellcheck disable=SC2086  # the package list is meant to split
+    mamba create --yes --prefix "$PB_ENV" $PB_CONDA_PACKAGES
 fi
 
 # shellcheck disable=SC2086  # the module list is meant to split

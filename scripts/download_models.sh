@@ -7,6 +7,8 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$repo/configs/carc.env"
 
+pb_login_limits
+
 hf="$PB_ENV/bin/hf"
 if [[ ! -x "$hf" ]]; then
     echo "ERROR: $hf not found; run scripts/setup_env.sh first" >&2
@@ -16,7 +18,7 @@ fi
 while IFS=$'\t' read -r name repo_id revision role; do
     [[ -z "$name" || "$name" == \#* ]] && continue
     echo "== $name ($role): $repo_id@$revision"
-    "$hf" download "$repo_id" --revision "$revision" --local-dir "$PB_MODELS/$name" </dev/null
+    "$hf" download "$repo_id" --revision "$revision" --local-dir "$PB_MODELS/$name" --max-workers 4 </dev/null
     "$hf" cache verify "$repo_id" --revision "$revision" --local-dir "$PB_MODELS/$name" </dev/null
 done < "$PB_MODEL_LIST"
 

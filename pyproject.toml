@@ -12,5 +12,8 @@ requires-python = ">=3.11,<3.15"
 [tool.setuptools.packages.find]
 include = ["parabeam*"]
 
+[tool.setuptools.package-data]
+"parabeam.eval" = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -15,9 +15,16 @@ Scaling PRM-guided beam search across GPUs with asynchronous work stealing. EE/C
 - parabeam/tools: calibration, GPU budget, plots
 - configs, slurm, scripts, tests
 
+## Tests
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
 ## Setup on CARC Discovery
 
-Run these on a login node, from the repo root. Connecting from outside USC needs the VPN.
+Run these on a login node, from the repo root. Connecting from outside USC needs the VPN. Login nodes cap each user at 64 tasks, which is why the scripts limit their threads.
 
 ```bash
 bash scripts/setup_env.sh                                            # Python environment on /scratch1

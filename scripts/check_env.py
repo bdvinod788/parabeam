@@ -17,6 +17,7 @@ PRM_ARCH = "Qwen2ForProcessRewardModel"
 def check_env(gpu: bool) -> list[str]:
     import torch
     import vllm
+    import vllm.engine.arg_utils  # what `vllm serve` loads; `import vllm` alone is lazy
     from mpi4py import MPI
     from vllm import ModelRegistry
 

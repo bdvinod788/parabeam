@@ -32,12 +32,17 @@ export MPICC
     -r "$repo/requirements-gpu.txt" \
     -e "$repo"
 
-# Prebuilt kernels only save compile time at server startup, so a failure here
-# (for example no GPU on the login node) does not stop the setup.
-"$PB_ENV/bin/vllm" download-kernels || echo "WARNING: vllm download-kernels failed; continuing" >&2
+# PyPI's torchcodec needs CUDA 13 and the newest cu129 build is too old for this
+# torch. vLLM uses it only for audio and runs without it, but with it installed
+# every vLLM command dies at import, because the load error is not an ImportError.
+"$PB_ENV/bin/python" -m pip uninstall --yes torchcodec
+
+# Every vLLM command, even download-kernels, needs a GPU, so slurm/smoke.sbatch
+# installs the prebuilt kernels instead.
 
 "$PB_ENV/bin/python" "$repo/scripts/check_env.py"
 "$PB_ENV/bin/python" -m pip freeze --exclude-editable > "$repo/configs/requirements-carc.lock"
 
 echo "Environment ready at $PB_ENV"
 echo "Lock file written to configs/requirements-carc.lock; commit it."
+echo "Next: sbatch --account=<project_id> slurm/smoke.sbatch, which installs vLLM's kernels."

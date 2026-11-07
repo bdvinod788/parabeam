@@ -11,6 +11,10 @@ from typing import Literal, Protocol
 Finish = Literal["stop", "length", "eos"]
 
 
+class Aborted(Exception):
+    """Raised by generate when its request was aborted."""
+
+
 @dataclass(frozen=True, slots=True)
 class GenReq:
     """One child expansion."""
@@ -34,10 +38,14 @@ class StepOut:
 class Backend(Protocol):
     async def generate(self, req: GenReq) -> StepOut: ...
 
+    def prm_step_ids(self, out: StepOut) -> list[int]:
+        """Return the PRM's IDs for a step: no trailing blank line, then <extra_0>."""
+        ...
+
     async def score(self, prm_ids: list[list[int]]) -> list[float]:
         """Return the newest step's reward for each input."""
         ...
 
     def abort(self, beam_id: str) -> None:
-        """Cancel a pruned early start."""
+        """Cancel a pruned early start. Does nothing if it has already finished."""
         ...

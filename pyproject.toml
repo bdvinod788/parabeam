@@ -14,6 +14,7 @@ include = ["parabeam*"]
 
 [tool.setuptools.package-data]
 "parabeam.eval" = ["*.json"]
+"parabeam.backends" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

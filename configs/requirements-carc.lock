@@ -40,6 +40,14 @@ fastapi-cloud-cli==0.26.0
 fastar==0.12.0
 fastsafetensors==0.5.0
 filelock==4.2.9
+flashinfer-cubin==0.7.0.post1
+flashinfer-jit-cache==0.7.0.post1+cu129
+flashinfer-jit-cache-sm100a==0.7.0.post1+cu129
+flashinfer-jit-cache-sm103a==0.7.0.post1+cu129
+flashinfer-jit-cache-sm120f==0.7.0.post1+cu129
+flashinfer-jit-cache-sm80==0.7.0.post1+cu129
+flashinfer-jit-cache-sm89==0.7.0.post1+cu129
+flashinfer-jit-cache-sm90a==0.7.0.post1+cu129
 flashinfer-python==0.7.0.post1
 frozenlist==1.8.0
 fsspec==2026.7.0
@@ -188,7 +196,6 @@ tokenspeed-triton==3.9.10.post20261028
 torch==2.13.0+cu129
 torch_c_dlpack_ext==0.1.5
 torchaudio==2.11.0+cu129
-torchcodec==0.17.0
 torchvision==0.28.0+cu129
 tqdm==4.70.1
 transformers==5.19.0

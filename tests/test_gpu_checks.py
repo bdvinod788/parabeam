@@ -65,3 +65,23 @@ def test_the_card_example_is_the_one_whose_rewards_we_expect():
     assert len(card["response"]) == len(checks.CARD_REWARDS) == 4
     assert card["system"] == checks.SYSTEM
     assert card["response"][-1].endswith("The answer is (\\boxed{30}).")
+
+
+def test_newest_reads_both_pooling_shapes():
+    assert checks.newest([[0.9, 0.1], [0.3, 0.7]]) == 0.7  # token_classify rows
+    assert checks.newest([0.3, 0.7]) == 0.7  # classify: the last token's row
+
+
+def test_cached_share_counts_only_levels_after_the_first():
+    levels = [
+        {"level": 1, "cache_hits": 0, "cache_queries": 1000},
+        {"level": 2, "cache_hits": 900, "cache_queries": 1000},
+        {"level": 3, "cache_hits": 700, "cache_queries": 1000},
+    ]
+    assert checks.cached_share(levels) == (0.8, 2000)
+    assert checks.cached_share(levels[:1]) == (0.0, 0)
+
+
+def test_the_cached_prm_uses_the_plugin():
+    assert checks.PRM_LAST_ARCH in " ".join(checks.CACHED_PRM)
+    assert checks.CACHED_TASK == "classify"

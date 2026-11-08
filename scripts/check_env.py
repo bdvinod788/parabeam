@@ -20,6 +20,9 @@ def check_env(gpu: bool) -> list[str]:
     import vllm.engine.arg_utils  # what `vllm serve` loads; `import vllm` alone is lazy
     from mpi4py import MPI
     from vllm import ModelRegistry
+    from vllm.plugins import load_general_plugins
+
+    from parabeam.backends.vllm_plugin import PRM_LAST_ARCH
 
     mpi_library = MPI.Get_library_version().splitlines()[0]
     print(f"python {sys.version.split()[0]}")
@@ -36,6 +39,9 @@ def check_env(gpu: bool) -> list[str]:
         errors.append(f"mpi4py is not linked to Open MPI {OPEN_MPI_VERSION}")
     if PRM_ARCH not in ModelRegistry.get_supported_archs():
         errors.append(f"vLLM does not register {PRM_ARCH}")
+    load_general_plugins()
+    if PRM_LAST_ARCH not in ModelRegistry.get_supported_archs():
+        errors.append(f"the parabeam vLLM plugin is missing; rerun pip install -e . ({PRM_LAST_ARCH})")
 
     if gpu:
         if torch.cuda.is_available():

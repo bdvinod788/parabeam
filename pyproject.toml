@@ -9,6 +9,10 @@ description = "Scaling PRM-guided beam search across GPUs with asynchronous work
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 
+# Lets vLLM serve the PRM with prefix caching; see parabeam/backends/vllm_prm.py.
+[project.entry-points."vllm.general_plugins"]
+parabeam_prm = "parabeam.backends.vllm_plugin:register"
+
 [tool.setuptools.packages.find]
 include = ["parabeam*"]
 

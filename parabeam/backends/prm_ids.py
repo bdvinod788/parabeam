@@ -54,10 +54,17 @@ def probabilities(row: Sequence[float]) -> list[float]:
 
 
 def tag_rewards(ids: Sequence[int], rows: Sequence[Sequence[float]], tag_id: int) -> list[float]:
-    """Return the reward at every tag, given one row per input token."""
-    if len(rows) != len(ids):
-        raise ValueError(f"expected one row per token, got {len(rows)} rows for {len(ids)} tokens")
-    return [probabilities(row)[POSITIVE] for token, row in zip(ids, rows) if token == tag_id]
+    """Return the reward at every tag.
+
+    STEP pooling returns one row per tag when the server knows the tag, and one
+    row per token otherwise; both are accepted.
+    """
+    tags = sum(token == tag_id for token in ids)
+    if len(rows) == len(ids) and len(rows) != tags:
+        rows = [row for token, row in zip(ids, rows) if token == tag_id]
+    elif len(rows) != tags:
+        raise ValueError(f"got {len(rows)} rows for {tags} tags in {len(ids)} tokens")
+    return [probabilities(row)[POSITIVE] for row in rows]
 
 
 def newest_reward(rows: Sequence[Sequence[float]]) -> float:

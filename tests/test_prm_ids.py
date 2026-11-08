@@ -49,9 +49,14 @@ def test_tag_rewards_take_the_positive_column_at_tags():
     assert tag_rewards(ids, rows, TAG) == [0.8, 0.3]
 
 
-def test_tag_rewards_need_a_row_per_token():
+def test_tag_rewards_accept_one_row_per_tag():
+    assert tag_rewards([1, TAG, 2, TAG], [[0.2, 0.8], [0.7, 0.3]], TAG) == [0.8, 0.3]
+    assert tag_rewards([TAG, TAG], [[0.2, 0.8], [0.7, 0.3]], TAG) == [0.8, 0.3]
+
+
+def test_tag_rewards_reject_other_row_counts():
     with pytest.raises(ValueError):
-        tag_rewards([1, TAG], [[0.5, 0.5]], TAG)
+        tag_rewards([1, 2, TAG], [[0.5, 0.5], [0.5, 0.5]], TAG)
 
 
 def test_the_newest_reward_is_the_last_row():

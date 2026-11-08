@@ -6,9 +6,9 @@ Phases run in order, each with the GPU to itself unless stated:
   2. Check 4 reference: Transformers scores them with the PRM.
   3. Check 4: vLLM's PRM, as configured by default (STEP pooling, no prefix
      caching), must match the reference.
-  4. Check 5: vLLM's PRM with ALL pooling and prefix caching, scored level by
+  4. Check 5: the PRM through parabeam's LAST-pooling plugin, scored level by
      level as the search would, must give the same newest-step rewards while
-     computing fewer tokens.
+     reading most of each level from the prefix cache.
   5. Check 3: both servers together, the generator under N = 256 requests.
 
 Everything measured goes to logs/pb-checks-<job>.json.
@@ -30,12 +30,15 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from parabeam.backends.prm_ids import (  # noqa: E402
+    POSITIVE,
     STEP_TAG,
     SYSTEM,
     newest_reward,
+    probabilities,
     solution_ids,
     tag_rewards,
 )
+from parabeam.backends.vllm_plugin import PRM_LAST_ARCH  # noqa: E402
 
 MODELS = Path(os.environ.get("PB_MODELS", "models"))
 GENERATOR = MODELS / "generator"
@@ -52,7 +55,8 @@ MAX_STEPS = 40
 MAX_PRM_TOKENS = 4000  # both models stop at 4,096
 LOAD_BEAMS = 256
 LOAD_TOKENS = 2048
-START_TIMEOUT = 600
+START_TIMEOUT = 900  # a cold generator start took 492 s
+FP32_ITEMS = 4  # solutions rescored in fp32, to show how much bf16 alone moves rewards
 
 # The plan asks for agreement "to about 0.01". bf16 kernels differ between
 # Transformers and vLLM, so most rewards should agree within 0.01 and none by
@@ -61,9 +65,11 @@ P95_TOLERANCE = 0.01
 MAX_TOLERANCE = 0.05
 CACHED_SHARE = 0.5  # with caching, deeper levels must compute under half their tokens
 
-# ALL pooling returns a row per computed token, so it can cache; STEP cannot.
-CACHED_PRM = ("--pooler-config", json.dumps({"tok_pooling_type": "ALL"}),
+# vLLM never reads the cache for token_classify requests, so the stock PRM
+# cannot cache. The plugin serves it for classify requests with LAST pooling.
+CACHED_PRM = ("--hf-overrides", json.dumps({"architectures": [PRM_LAST_ARCH]}),
               "--enable-prefix-caching")
+CACHED_TASK = "classify"
 
 
 class Report:
@@ -284,19 +290,31 @@ def reference(items_path: Path, out_path: Path) -> None:
             "matches_card": full[: len(ids)] == ids,
             "card_rewards": rewards(full),
         })
+
+    # The card example and a few solutions again in fp32 (about 30 GB), to show
+    # how far bf16 rounding alone moves a reward. rewards() sees the new model.
+    del model
+    torch.cuda.empty_cache()
+    model = Qwen2Model.from_pretrained(PRM, dtype=torch.float32, attn_implementation="sdpa")
+    model = model.cuda().eval()
+    head = head.float()
+    out["fp32"] = {
+        "card": rewards(out["card"]["ids"]),
+        "items": [rewards(item["ids"]) for item in out["items"][:FP32_ITEMS]],
+    }
     out_path.write_text(json.dumps(out))
 
 
 # Phases 3 and 4 --------------------------------------------------------------
 
 
-async def pool(url: str, inputs: list[list[int]]) -> tuple[list[list[list[float]]], float]:
+async def pool(url: str, inputs: list[list[int]], task: str = "token_classify") -> tuple[list, float]:
     import httpx
 
     start = time.perf_counter()
     async with httpx.AsyncClient(timeout=900) as client:
         reply = await client.post(f"{url}/pooling", json={
-            "model": "prm", "input": inputs, "task": "token_classify",
+            "model": "prm", "input": inputs, "task": task,
         })
     elapsed = time.perf_counter() - start
     if reply.status_code != 200:
@@ -305,24 +323,60 @@ async def pool(url: str, inputs: list[list[int]]) -> tuple[list[list[list[float]
     return [item["data"] for item in data], elapsed
 
 
-async def score_by_level(url: str, items: list[dict], tag_id: int) -> dict:
-    """Score each level's prefixes in one batch, deepest level last."""
+def newest(data: list) -> float:
+    """Return the newest step's reward from one input's pooling output.
+
+    token_classify returns rows, whose last is the newest tag; classify returns
+    the last token's single row.
+    """
+    if data and isinstance(data[0], list):
+        return newest_reward(data)
+    return probabilities(data)[POSITIVE]
+
+
+async def cache_counters(url: str) -> tuple[float, float]:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        text = (await client.get(f"{url}/metrics")).text
+    return (metric(text, "vllm:prefix_cache_hits") or 0.0,
+            metric(text, "vllm:prefix_cache_queries") or 0.0)
+
+
+async def score_by_level(url: str, items: list[dict], tag_id: int,
+                         task: str = "token_classify") -> dict:
+    """Score each level's prefixes in one batch, deepest level last.
+
+    Each level records the prefix-cache tokens queried and hit while it ran.
+    """
     prefixes = [level_prefixes(item["ids"], tag_id) for item in items]
     depth = max(map(len, prefixes))
     levels = []
+    hits, queries = await cache_counters(url)
     for level in range(depth):
         members = [i for i, p in enumerate(prefixes) if len(p) > level]
         inputs = [prefixes[i][level] for i in members]
-        rows, elapsed = await pool(url, inputs)
+        data, elapsed = await pool(url, inputs, task)
+        new_hits, new_queries = await cache_counters(url)
         levels.append({
             "level": level + 1,
             "members": members,
             "seconds": elapsed,
             "tokens": sum(map(len, inputs)),
-            "rows": sum(map(len, rows)),
-            "rewards": [newest_reward(r) for r in rows],
+            "cache_hits": new_hits - hits,
+            "cache_queries": new_queries - queries,
+            "rewards": [newest(d) for d in data],
         })
+        hits, queries = new_hits, new_queries
     return {"levels": levels}
+
+
+def cached_share(levels: list[dict]) -> tuple[float, float]:
+    """Return the share of tokens read from the cache at levels 2+, and the tokens queried."""
+    deep = [level for level in levels if level["level"] >= 2]
+    queried = sum(level["cache_queries"] for level in deep)
+    hit = sum(level["cache_hits"] for level in deep)
+    return (hit / queried if queried else 0.0), queried
 
 
 def newest_reference(items: list[dict], levels: list[dict]) -> tuple[list[float], list[float]]:
@@ -373,13 +427,13 @@ async def load_test(gen_url: str, prm_url: str, questions: list[str], items: lis
             generate(gen_url, prompts, 1, LOAD_TOKENS, seed=10_000)
         )
         await asyncio.sleep(20)  # let the batch fill before the PRM joins
-        prm_busy = await score_by_level(prm_url, items, tag_id)
+        prm_busy = await score_by_level(prm_url, items, tag_id, CACHED_TASK)
         outs = await generation
     finally:
         done.set()
         await watcher
     wall = time.perf_counter() - start
-    prm_alone = await score_by_level(prm_url, items, tag_id)
+    prm_alone = await score_by_level(prm_url, items, tag_id, CACHED_TASK)
     after = await preemptions()
     tokens = sum(out["tokens"] for out in outs)
     return {
@@ -442,10 +496,21 @@ def main() -> int:
     wait_for_free_gpu()
     if done.returncode == 0:
         ref = json.loads(ref_path.read_text())
+        # The card's printed rewards come from its own run, whose kernels we do
+        # not know, so they are reported beside bf16 and fp32 rather than gated.
         card = differences(ref["card"]["rewards"], CARD_REWARDS)
         results["reference_vs_card"] = card
-        report.check(within_tolerance(card),
-                     f"reference reproduces the model card's rewards (max diff {card['max']:.4f})")
+        fp32 = ref["fp32"]
+        results["card_rewards"] = {"printed": CARD_REWARDS, "bf16": ref["card"]["rewards"],
+                                   "fp32": fp32["card"]}
+        report.note("card rewards, printed / bf16 / fp32: " + ", ".join(
+            f"{a:.4f}/{b:.4f}/{c:.4f}" for a, b, c in
+            zip(CARD_REWARDS, ref["card"]["rewards"], fp32["card"])))
+        bf16_vs_fp32 = differences([r for i in ref["items"][:FP32_ITEMS] for r in i["rewards"]],
+                                   [r for rs in fp32["items"] for r in rs])
+        results["bf16_vs_fp32"] = bf16_vs_fp32
+        report.note(f"bf16 vs fp32 on {bf16_vs_fp32['count']} steps: "
+                    f"p95 {bf16_vs_fp32['p95']:.4f}, max {bf16_vs_fp32['max']:.4f}")
         matches = sum(item["matches_card"] for item in ref["items"])
         results["ids_match_card"] = [matches, len(ref["items"])]
         report.check(matches == len(ref["items"]),
@@ -465,15 +530,14 @@ def main() -> int:
             with Server("prm-step", "prm", PRM, prm_port, PRM_FRACTION, log_dir, job) as prm:
                 results["prm_startup_s"] = prm.startup_s
                 rows, _ = asyncio.run(pool(prm.url, [ref["card"]["ids"]]))
-                card = differences(tag_rewards(ref["card"]["ids"], rows[0], tag_id), CARD_REWARDS)
-                results["vllm_vs_card"] = card
-                report.check(within_tolerance(card),
-                             f"check 4: vLLM reproduces the model card's rewards "
-                             f"(max diff {card['max']:.4f})")
+                card_vllm = tag_rewards(ref["card"]["ids"], rows[0], tag_id)
+                results["card_rewards"]["vllm"] = card_vllm
+                report.note("card rewards from vLLM: " + ", ".join(f"{r:.4f}" for r in card_vllm))
                 rows, _ = asyncio.run(pool(prm.url, [item["ids"] for item in items_ref]))
-                got = [r for item, row in zip(items_ref, rows)
-                       for r in tag_rewards(item["ids"], row, tag_id)]
-                stats = differences(got, [r for item in items_ref for r in item["rewards"]])
+                got = card_vllm + [r for item, row in zip(items_ref, rows)
+                                   for r in tag_rewards(item["ids"], row, tag_id)]
+                want = ref["card"]["rewards"] + [r for item in items_ref for r in item["rewards"]]
+                stats = differences(got, want)
                 results["check4"] = stats
                 report.check(within_tolerance(stats),
                              f"check 4: vLLM matches Transformers on {stats['count']} steps "
@@ -485,35 +549,28 @@ def main() -> int:
             report.failed(f"check 4: {error}")
             uncached = None
 
-        # Phase 4: check 5, ALL pooling with prefix caching.
+        # Phase 4: check 5, the LAST-pooling plugin with prefix caching.
         try:
-            with Server("prm-all", "prm", PRM, prm_port, PRM_FRACTION, log_dir, job,
+            with Server("prm-last", "prm", PRM, prm_port, PRM_FRACTION, log_dir, job,
                         CACHED_PRM) as prm:
-                enabled = prm.log_says("enable_prefix_caching=True")
-                report.check(enabled, "check 5: the PRM server runs with prefix caching on")
-                cached = asyncio.run(score_by_level(prm.url, items_ref, tag_id))
+                report.check(prm.log_says(PRM_LAST_ARCH),
+                             f"check 5: the PRM server loaded the plugin's {PRM_LAST_ARCH}")
+                report.check(prm.log_says("enable_prefix_caching=True"),
+                             "check 5: the PRM server runs with prefix caching on")
+                cached = asyncio.run(score_by_level(prm.url, items_ref, tag_id, CACHED_TASK))
                 results["cached_levels"] = cached
                 got, want = newest_reference(items_ref, cached["levels"])
                 stats = differences(got, want)
                 results["check5_rewards"] = stats
                 report.check(within_tolerance(stats),
-                             f"check 5: cached newest-step rewards match Transformers "
-                             f"(p95 {stats['p95']:.4f}, max {stats['max']:.4f})")
-                deep = [lv for lv in cached["levels"] if lv["level"] >= 2]
-                share = sum(lv["rows"] for lv in deep) / max(1, sum(lv["tokens"] for lv in deep))
-                results["check5_computed_share"] = share
-                report.check(share < CACHED_SHARE,
-                             f"check 5: levels 2+ computed {share:.1%} of their tokens")
-                async def hit_rate() -> tuple[float | None, float | None]:
-                    import httpx
-                    async with httpx.AsyncClient() as client:
-                        text = (await client.get(f"{prm.url}/metrics")).text
-                    return (metric(text, "vllm:prefix_cache_hits"),
-                            metric(text, "vllm:prefix_cache_queries"))
-                hits, queries = asyncio.run(hit_rate())
-                results["check5_prefix_cache"] = {"hits": hits, "queries": queries}
-                if hits is not None and queries:
-                    report.note(f"PRM prefix cache hit rate {hits / queries:.1%}")
+                             f"check 5: cached newest-step rewards match Transformers on "
+                             f"{stats['count']} steps (p95 {stats['p95']:.4f}, "
+                             f"max {stats['max']:.4f})")
+                share, queried = cached_share(cached["levels"])
+                results["check5_cached_share"] = share
+                report.check(queried > 0 and share > 1 - CACHED_SHARE,
+                             f"check 5: levels 2+ read {share:.1%} of {queried:.0f} tokens "
+                             f"from the prefix cache")
                 if uncached:
                     slow = sum(lv["seconds"] for lv in uncached["levels"])
                     fast = sum(lv["seconds"] for lv in cached["levels"])

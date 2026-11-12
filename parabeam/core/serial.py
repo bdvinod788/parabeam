@@ -28,6 +28,7 @@ class LevelStats:
     requests: int
     gen_s: float
     prm_s: float
+    gen_tokens: int = 0  # tokens generated across the level's requests
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +78,7 @@ def fingerprint(result: SearchResult) -> str:
     return digest.hexdigest()
 
 
-async def _generate_all(backend: Backend, expansions: list[Expansion]) -> list[StepOut]:
+async def generate_all(backend: Backend, expansions: list[Expansion]) -> list[StepOut]:
     async with asyncio.TaskGroup() as group:
         tasks = [group.create_task(backend.generate(e.req)) for e in expansions]
     return [task.result() for task in tasks]
@@ -100,7 +101,7 @@ async def search(
         level = survivors[0].level + 1
         expansions = plan_level(survivors, cfg)
         begin = clock()
-        outs = await _generate_all(backend, expansions)
+        outs = await generate_all(backend, expansions)
         generated = clock()
         children = [
             e.parent.child(e.index, out, backend.prm_step_ids(out))
@@ -113,7 +114,10 @@ async def search(
         finished.extend(done)
         kept.append(tuple(beam.path for beam in survivors))
         candidates.append(candidate_digest(scored))
-        levels.append(LevelStats(level, len(expansions), generated - begin, scored_at - generated))
+        tokens = sum(len(out.token_ids) for out in outs)
+        levels.append(
+            LevelStats(level, len(expansions), generated - begin, scored_at - generated, tokens)
+        )
     return SearchResult(
         problem.id,
         tuple(sorted(finished, key=lambda beam: beam.path)),

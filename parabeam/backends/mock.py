@@ -180,6 +180,16 @@ class MockBackend:
             return (time.perf_counter() - self._started) / self._scale
         return self._simulated
 
+    def advance_to(self, t: float) -> None:
+        """Idle until simulated time t, as a rank does at a barrier.
+
+        Ranks in a run have one backend each, so their simulated clocks drift
+        apart; schedulers call this with the slowest rank's time when they meet.
+        Real time needs no help, so with scale>0 this does nothing.
+        """
+        if not self._scale:
+            self._simulated = max(self._simulated, t)
+
     async def _elapse(self, seconds: float) -> None:
         if self._scale:
             await asyncio.sleep(seconds * self._scale)

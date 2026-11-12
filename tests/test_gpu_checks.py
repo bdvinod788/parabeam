@@ -85,3 +85,25 @@ def test_cached_share_counts_only_levels_after_the_first():
 def test_the_cached_prm_uses_the_plugin():
     assert checks.PRM_LAST_ARCH in " ".join(checks.CACHED_PRM)
     assert checks.CACHED_TASK == "classify"
+
+
+def test_calibration_helpers():
+    import random
+
+    from parabeam.tools import calibrate
+
+    batch = 8
+    long = 1.0 + 0.5 * batch * (calibrate.LONG - calibrate.SHORT)
+    assert calibrate.decode_step(1.0, long, batch) == 0.5
+    prompts = calibrate.prompts_for(10, 5, random.Random(0))
+    assert len(prompts) == 10 and all(len(p) == 5 for p in prompts)
+    assert len({tuple(p) for p in prompts}) == 3  # groups of four share a prefix
+    assert prompts[0] == prompts[3] != prompts[4]
+    assert all(t < calibrate.VOCAB for p in prompts for t in p)
+
+
+def test_prometheus_values():
+    from parabeam.eval.metrics import prometheus_value
+
+    assert prometheus_value('vllm:num_preemptions_total{a="1"} 2\nvllm:x 1', "vllm:num_preemptions") == 2
+    assert prometheus_value("vllm:x 1", "vllm:y") is None

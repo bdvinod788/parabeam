@@ -1,7 +1,8 @@
 """Every policy must keep exactly the beams the serial search keeps.
 
-The real schedulers replace `scattered` as they are built: level-sync on Nov 12,
-async on Nov 16. The sabotaged policies check that this harness can fail.
+The real schedulers get their own tests as they are built: level-sync in
+test_levelsync.py, async on Nov 16. The sabotaged policies check that this
+harness can fail.
 """
 import asyncio
 import random

@@ -82,15 +82,14 @@ def gpu_info() -> str | None:
 
 
 def write_manifest(out: Path, config: dict, extra: dict) -> None:
-    """Write the manifest, or check that a resumed run used the same settings."""
+    """Write the manifest; a run that resumes earlier results is listed under "resumed".
+
+    A manifest whose run wrote no results is replaced, so a job that failed
+    before its first problem does not keep its name on the results that follow.
+    Results from other settings or other code are never mixed.
+    """
     path = out / MANIFEST
-    if path.exists():
-        old = json.loads(path.read_text())
-        if old["config"] != config:
-            raise SystemExit(f"{path} was written with other settings: {old['config']}")
-        return
-    path.write_text(json.dumps({
-        "config": config,
+    session = {
         "code": code_version(),
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "host": socket.gethostname(),
@@ -99,7 +98,18 @@ def write_manifest(out: Path, config: dict, extra: dict) -> None:
         "python": platform.python_version(),
         "argv": sys.argv,
         **extra,
-    }, indent=1) + "\n")
+    }
+    if path.exists() and done_ids(out):
+        old = json.loads(path.read_text())
+        if old["config"] != config:
+            raise SystemExit(f"{path} was written with other settings: {old['config']}")
+        if old["code"] != session["code"]:
+            raise SystemExit(f"{path} holds results from other code: {old['code']}; "
+                             "pass a new --out")
+        old.setdefault("resumed", []).append(session)
+        path.write_text(json.dumps(old, indent=1) + "\n")
+        return
+    path.write_text(json.dumps({"config": config, **session}, indent=1) + "\n")
 
 
 def done_ids(out: Path) -> set[int]:

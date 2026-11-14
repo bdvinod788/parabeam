@@ -36,6 +36,32 @@ def test_a_rerun_skips_finished_problems(monkeypatch, tmp_path):
     assert again == first  # nothing was appended
 
 
+def test_a_rerun_is_listed_as_resumed(monkeypatch, tmp_path):
+    go(monkeypatch, tmp_path)
+    monkeypatch.setenv("SLURM_JOB_ID", "222")
+    go(monkeypatch, tmp_path, "--limit", "3")
+    manifest = json.loads((tmp_path / run.MANIFEST).read_text())
+    assert manifest["slurm_job"] != "222"
+    assert [s["slurm_job"] for s in manifest["resumed"]] == ["222"]
+
+
+def test_a_manifest_without_results_is_replaced(monkeypatch, tmp_path):
+    stale = {"config": {"old": True}, "code": {"commit": "old"}, "slurm_job": "111"}
+    (tmp_path / run.MANIFEST).write_text(json.dumps(stale))
+    monkeypatch.setenv("SLURM_JOB_ID", "222")
+    go(monkeypatch, tmp_path)
+    manifest = json.loads((tmp_path / run.MANIFEST).read_text())
+    assert manifest["slurm_job"] == "222" and manifest["code"] == run.code_version()
+    assert "resumed" not in manifest
+
+
+def test_results_from_other_code_are_not_resumed(monkeypatch, tmp_path):
+    go(monkeypatch, tmp_path)
+    monkeypatch.setattr(run, "code_version", lambda: {"commit": "other"})
+    with pytest.raises(SystemExit, match="other code"):
+        go(monkeypatch, tmp_path)
+
+
 def test_a_rerun_with_other_settings_is_refused(monkeypatch, tmp_path):
     go(monkeypatch, tmp_path)
     with pytest.raises(SystemExit):

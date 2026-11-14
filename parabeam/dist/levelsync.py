@@ -48,6 +48,18 @@ class RankLevel:
     gen_tokens: int
     moved_in: int  # survivors received from other ranks
     sent_bytes: int  # everything this rank sent during the level
+    # When each phase began, on this rank's clock: move, generate, score,
+    # allgather, and when the allgather returned. Gantt charts come from these.
+    marks: tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
+    steps: tuple[Step, ...] = ()  # one per request, in expansion order
+
+
+class Step(NamedTuple):
+    """One generated step: its tokens, why it stopped, and how long it took."""
+
+    tokens: int
+    finish: str
+    seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,10 +202,13 @@ async def search(
         finished.extend(child for child in scored if is_finished(child, cfg))
         kept.append(tuple(survivors))
         digests.append(candidate_digest(Scored(c.score, c.path) for c in candidates))
+        gathered_at = clock()
         mine.append(RankLevel(
             comm.rank, level, len(expansions), generated - begin, scored_at - generated,
-            begin - moving, clock() - scored_at, sum(len(out.token_ids) for out in outs),
+            begin - moving, gathered_at - scored_at, sum(len(out.token_ids) for out in outs),
             moved_in, comm.sent_bytes - sent_before,
+            (moving, begin, generated, scored_at, gathered_at),
+            tuple(Step(len(out.token_ids), out.finish, out.t_end - out.t_start) for out in outs),
         ))
 
     gathered = await gather((finished, mine))

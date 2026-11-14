@@ -81,3 +81,65 @@ def test_mock_runs_match_the_serial_search(monkeypatch, tmp_path):
     for record in records:
         result = asyncio.run(search(mock_problem(record["id"]), cfg, backend, backend.now))
         assert fingerprint(result) == record["fingerprint"]
+
+
+def levelsync(monkeypatch, out, ranks=4, *extra):
+    argv = ["run", "levelsync", "--backend", "mock", "--local", str(ranks), "--subset", "pilot",
+            "--limit", "3", "--N", "16", "--M", "4", "--out", str(out), *extra]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exit_:
+        run.main()
+    return exit_.value.code
+
+
+def lines(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_level_sync_runs_match_serial_runs(monkeypatch, tmp_path):
+    serial = go(monkeypatch, tmp_path / "serial")
+    assert levelsync(monkeypatch, tmp_path / "ls") == 0
+    records = lines(tmp_path / "ls" / run.RESULTS)
+    assert [r["fingerprint"] for r in records] == [r["fingerprint"] for r in serial]
+    assert all(r["requests"] == 16 * r["levels"] for r in records)
+    manifest = json.loads((tmp_path / "ls" / run.MANIFEST).read_text())
+    assert manifest["config"]["P"] == 4 and [r["rank"] for r in manifest["ranks"]] == [0, 1, 2, 3]
+
+
+def test_each_rank_logs_its_levels_steps_and_phases(monkeypatch, tmp_path):
+    assert levelsync(monkeypatch, tmp_path) == 0
+    records = {r["id"]: r for r in lines(tmp_path / run.RESULTS)}
+    logs = [lines(tmp_path / "ranks" / f"rank-{rank}.jsonl") for rank in range(4)]
+    for rank, log in enumerate(logs):
+        assert {line["rank"] for line in log} == {rank}
+        for line in log:
+            assert len(line["steps"]) == line["requests"]
+            assert sum(tokens for tokens, _, _ in line["steps"]) == line["gen_tokens"]
+            assert all(finish in {"stop", "length", "eos"} for _, finish, _ in line["steps"])
+            assert line["marks"] == sorted(line["marks"]) and line["marks"][0] >= 0
+    for problem_id, record in records.items():
+        per_rank = [[line for line in log if line["id"] == problem_id] for log in logs]
+        assert all(len(levels) == record["levels"] for levels in per_rank)
+        assert sum(line["requests"] for levels in per_rank for line in levels) == record["requests"]
+        # The ranks leave each level's allgather together, on the synced mock clocks.
+        for level in range(record["levels"]):
+            assert len({levels[level]["marks"][4] for levels in per_rank}) == 1
+
+
+def test_a_level_sync_rerun_resumes_and_other_settings_are_refused(monkeypatch, tmp_path, capsys):
+    assert levelsync(monkeypatch, tmp_path) == 0
+    first = (tmp_path / run.RESULTS).read_text()
+    assert levelsync(monkeypatch, tmp_path) == 0
+    assert (tmp_path / run.RESULTS).read_text() == first
+    capsys.readouterr()
+    assert levelsync(monkeypatch, tmp_path, 2) == 1
+    assert capsys.readouterr().err.count("other settings") == 1  # rank 0 reports it once
+
+
+def test_local_ranks_need_the_mock(monkeypatch, tmp_path):
+    argv = ["run", "levelsync", "--local", "2", "--gen-url", "u", "--prm-url", "u",
+            "--out", str(tmp_path)]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exit_:
+        run.main()
+    assert exit_.value.code == 2

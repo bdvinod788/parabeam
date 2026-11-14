@@ -30,8 +30,11 @@ pb_wait_healthy() {  # name url pid log
 }
 
 pb_start_servers() {
-    local prefix="$1" job="${SLURM_JOB_ID:-0}"
-    local gen_port=$((20000 + job % 10000)) prm_port=$((30000 + job % 10000))
+    # Ports from the job ID, plus the task's slot on its node, so ranks that
+    # share a node (and jobs that share one) do not collide.
+    local prefix="$1" job="${SLURM_JOB_ID:-0}" slot="${SLURM_LOCALID:-0}"
+    local offset=$(((job % 1000) * 8 + slot))
+    local gen_port=$((20000 + offset)) prm_port=$((30000 + offset))
     export PB_GEN_URL="http://127.0.0.1:$gen_port" PB_PRM_URL="http://127.0.0.1:$prm_port"
 
     vllm serve "$PB_MODELS/generator" --served-model-name generator --port "$gen_port" \

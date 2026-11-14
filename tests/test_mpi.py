@@ -56,3 +56,11 @@ def test_level_sync_matches_serial_over_mpi(ranks, extra):
     done = launch(ranks, "-m", "parabeam.dist.levelsync", "--limit", "2", "--N", "16", *extra)
     assert done.returncode == 0, done.stdout + done.stderr
     assert f"2 of 2 match the serial search, P={ranks}" in done.stdout
+
+
+def test_the_run_driver_over_mpi(tmp_path):
+    done = launch(2, "-m", "parabeam.eval.run", "levelsync", "--backend", "mock", "--subset",
+                  "pilot", "--limit", "2", "--N", "16", "--out", str(tmp_path))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 2
+    assert sorted(p.name for p in (tmp_path / "ranks").iterdir()) == ["rank-0.jsonl", "rank-1.jsonl"]

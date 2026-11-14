@@ -4,6 +4,9 @@
     python -m parabeam.eval.run serial --backend vllm --gen-url URL --prm-url URL \\
         --subset weak --N 256 --out runs/serial-n256
     python -m parabeam.eval.run greedy --gen-url URL --prm-url URL --subset weak --out runs/greedy
+    python -m parabeam.eval.run levelsync --backend mock --local 4 --subset pilot --out runs/ls
+    srun --mpi=pmix_v5 ... python -m parabeam.eval.run levelsync --subset weak --limit 20 \\
+        --out runs/levelsync-p4   (slurm/levelsync.sbatch; each rank has its own servers)
 
 Each run directory gets a manifest.json and one JSON line per problem, written
 as the problem finishes, so a job that runs out of time loses nothing and a
@@ -241,6 +244,158 @@ async def run_serial(args) -> None:
     summarize(out)
 
 
+async def levelsync_rank(args, comm) -> int:
+    """One rank of a level-sync run; returns the exit status, the same on every rank.
+
+    Rank 0 writes the manifest, results.jsonl and summary.json. Every rank
+    appends its own ranks/rank-<r>.jsonl: one line per problem and level, with
+    phase times measured from a barrier at the problem's start, and each
+    request's token count, finish reason and duration.
+    """
+    from parabeam.dist import levelsync
+
+    cfg = SearchConfig(args.N, args.M, args.max_depth, args.max_step_tokens)
+    vllm = args.backend == "vllm"
+    items, warmup = load_items(args.dataset, args.subset, not vllm)
+    items = items[: args.limit] if args.limit else items
+    config = {"mode": "levelsync", "backend": args.backend, "dataset": args.dataset,
+              "subset": args.subset, "N": cfg.N, "M": cfg.M, "max_depth": cfg.max_depth,
+              "max_step_tokens": cfg.max_step_tokens, "limit": args.limit, "P": comm.size,
+              "placement": args.placement}
+    backend, to_problem, clock = make_backend(args)
+    sync = getattr(backend, "advance_to", None) if not vllm else None
+    me = {"rank": comm.rank, "host": socket.gethostname(),
+          "gpu": gpu_info() if vllm else None, "gpu_uuid": os.environ.get("PB_GPU_UUID"),
+          "gen_url": args.gen_url, "prm_url": args.prm_url,
+          "vllm": await server_versions(args) if vllm else None}
+    ranks = await comm.allgather(me)
+
+    error, done = None, set()
+    if comm.rank == 0:
+        gpus = [(r["host"], r["gpu_uuid"]) for r in ranks if r["gpu_uuid"]]
+        if len(gpus) != len(set(gpus)):
+            error = f"ranks share a GPU: {gpus}"
+        else:
+            args.out.mkdir(parents=True, exist_ok=True)
+            try:
+                write_manifest(args.out, config, {"ranks": ranks})
+                done = done_ids(args.out)
+            except SystemExit as exit_:
+                error = str(exit_)
+    error, done = (await comm.allgather((error, sorted(done))))[0]
+    if error:
+        if comm.rank == 0:
+            print(error, file=sys.stderr, flush=True)
+        return 1
+    log_dir = args.out / "ranks"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"rank-{comm.rank}.jsonl"
+    job = os.environ.get("SLURM_JOB_ID")
+    watch = KvWatch(args.gen_url if vllm else None)
+
+    async def one(problem):
+        """Start every rank together, then search; return the result and this rank's t0."""
+        starts = await comm.allgather(clock())
+        if sync is not None:
+            sync(max(starts))
+        t0 = clock()
+        return await levelsync.search(problem, cfg, backend, comm, args.placement, clock,
+                                      sync), t0
+
+    try:
+        if vllm:
+            began = time.perf_counter()
+            await one(to_problem(warmup))
+            if comm.rank == 0:
+                print(f"warm-up problem {warmup.id}: {time.perf_counter() - began:.1f} s",
+                      flush=True)
+        for item in items:
+            if item.id in done:
+                continue
+            truncated, retried = getattr(backend, "truncated", 0), getattr(backend, "retried", 0)
+            watch.start()
+            run, t0 = await one(to_problem(item))
+            peak_kv = await watch.stop()
+            with log_path.open("a") as log:
+                for s in run.ranks:
+                    if s.rank == comm.rank:
+                        log.write(json.dumps({
+                            "id": item.id, "job": job, "rank": s.rank, "level": s.level,
+                            "requests": s.requests, "gen_tokens": s.gen_tokens,
+                            "moved_in": s.moved_in, "sent_bytes": s.sent_bytes,
+                            "marks": [round(m - t0, 4) for m in s.marks],
+                            "steps": [[st.tokens, st.finish, round(st.seconds, 4)]
+                                      for st in s.steps],
+                        }) + "\n")
+            mine = (peak_kv if vllm else None, getattr(backend, "truncated", 0) - truncated,
+                    getattr(backend, "retried", 0) - retried)
+            every = await comm.allgather(mine)
+            if comm.rank != 0:
+                continue
+            result = run.result
+            vote = weighted_vote(result.finished, last_boxed, same_answer)
+            answer = vote.answer if vote else None
+            kv = [k for k, _, _ in every]
+            record = {
+                "id": item.id,
+                "level": item.level,
+                "gold": item.gold,
+                "answer": answer,
+                "correct": is_correct(answer, item.gold) if vllm else None,
+                "seconds": result.seconds,
+                "levels": len(result.levels),
+                "finished": len(result.finished),
+                "requests": sum(lv.requests for lv in result.levels),
+                # A level's generate and score times are its slowest rank's.
+                "gen_s": sum(lv.gen_s for lv in result.levels),
+                "prm_s": sum(lv.prm_s for lv in result.levels),
+                "gen_tokens": sum(lv.gen_tokens for lv in result.levels),
+                "wait_s_mean": sum(s.wait_s for s in run.ranks) / comm.size,
+                "move_s_mean": sum(s.move_s for s in run.ranks) / comm.size,
+                "moved": sum(s.moved_in for s in run.ranks),
+                "sent_bytes": sum(s.sent_bytes for s in run.ranks),
+                "per_level": [[lv.level, lv.requests, round(lv.gen_s, 4), round(lv.prm_s, 4),
+                               lv.gen_tokens] for lv in result.levels],
+                "peak_kv": max(kv) if vllm else None,
+                "peak_kv_ranks": kv if vllm else None,
+                "vote_weight": vote.weight if vote else None,
+                "voters": vote.voters if vote else 0,
+                "fingerprint": fingerprint(result),
+                "prm_truncated": sum(t for _, t, _ in every),
+                "retried": sum(r for _, _, r in every),
+                "job": job,
+            }
+            append(args.out, record)
+            print(f"problem {item.id:>3}: {record['seconds']:7.1f} s, {record['levels']:>2} levels, "
+                  f"wait {record['wait_s_mean']:6.1f} s, moved {record['moved']:>4}, "
+                  f"answer {answer!r}, correct {record['correct']}", flush=True)
+    finally:
+        if hasattr(backend, "aclose"):
+            await backend.aclose()
+    if comm.rank == 0:
+        summarize(args.out)
+    return 0
+
+
+def run_levelsync(args) -> int:
+    if args.local:
+        from parabeam.dist.runtime import run_local
+
+        statuses = asyncio.run(run_local(args.local, lambda comm: levelsync_rank(args, comm)))
+        return max(statuses)
+    from parabeam.dist.runtime import MpiComm, abort_on_error
+
+    async def over_mpi() -> int:
+        comm = MpiComm()
+        try:
+            return await levelsync_rank(args, comm)
+        finally:
+            await comm.close()
+
+    with abort_on_error():
+        return asyncio.run(over_mpi())
+
+
 async def server_versions(args) -> dict:
     import httpx
 
@@ -314,7 +469,7 @@ def summarize(out: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="mode", required=True)
-    for name in ("serial", "greedy"):
+    for name in ("serial", "greedy", "levelsync"):
         p = sub.add_parser(name)
         p.add_argument("--out", type=Path, required=True)
         p.add_argument("--dataset", default="math500", choices=["math500", "gsm8k"])
@@ -322,16 +477,27 @@ def main() -> None:
         p.add_argument("--limit", type=int, help="run only the first problems of the subset")
         p.add_argument("--gen-url", default=os.environ.get("PB_GEN_URL"))
         p.add_argument("--prm-url", default=os.environ.get("PB_PRM_URL"))
-    serial = sub.choices["serial"]
-    serial.add_argument("--backend", default="vllm", choices=["vllm", "mock"])
-    serial.add_argument("--N", type=int, default=256)
-    serial.add_argument("--M", type=int, default=4)
-    serial.add_argument("--max-depth", type=int, default=40)
-    serial.add_argument("--max-step-tokens", type=int, default=2048)
+    for name in ("serial", "levelsync"):
+        p = sub.choices[name]
+        p.add_argument("--backend", default="vllm", choices=["vllm", "mock"])
+        p.add_argument("--N", type=int, default=256)
+        p.add_argument("--M", type=int, default=4)
+        p.add_argument("--max-depth", type=int, default=40)
+        p.add_argument("--max-step-tokens", type=int, default=2048)
+    from parabeam.dist.placement import PLACEMENTS
+
+    levelsync = sub.choices["levelsync"]
+    levelsync.add_argument("--placement", default="keep_local", choices=sorted(PLACEMENTS))
+    levelsync.add_argument("--local", type=int, metavar="P",
+                           help="mock only: run P ranks in this process instead of over MPI")
     args = parser.parse_args()
     needs_servers = args.mode == "greedy" or args.backend == "vllm"
     if needs_servers and not (args.gen_url and args.prm_url):
         parser.error("--gen-url and --prm-url (or PB_GEN_URL and PB_PRM_URL) are required")
+    if args.mode == "levelsync":
+        if args.local and args.backend != "mock":
+            parser.error("--local runs every rank in one process, so it needs --backend mock")
+        sys.exit(run_levelsync(args))
     asyncio.run(run_serial(args) if args.mode == "serial" else run_greedy(args))
 
 

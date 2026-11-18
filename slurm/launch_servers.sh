@@ -10,7 +10,7 @@ PB_PRM_FRACTION="${PB_PRM_FRACTION:-0.6}"
 PB_MAX_SEQS="${PB_MAX_SEQS:-256}"  # N = 256 per GPU, set explicitly
 PB_START_TIMEOUT="${PB_START_TIMEOUT:-900}"  # a cold generator start took 492 s
 PB_SERVER_PIDS=()
-# vLLM drops connections idle for 5 s by default, as long as httpx keeps them,
+# vLLM drops connections idle for 5 s by default, as long as httpx kept them,
 # so a reused connection could be closed mid-request (job 13956488). Keep this
 # above CLIENT_KEEP_ALIVE_S in parabeam/backends/vllm_http.py.
 export VLLM_HTTP_TIMEOUT_KEEP_ALIVE="${VLLM_HTTP_TIMEOUT_KEEP_ALIVE:-300}"

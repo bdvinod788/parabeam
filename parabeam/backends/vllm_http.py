@@ -32,7 +32,7 @@ TEMPERATURE = 0.8
 TOP_P = 1.0
 
 # vLLM closes a connection idle for VLLM_HTTP_TIMEOUT_KEEP_ALIVE seconds (5 by
-# default, the same as httpx's keep-alive), so a request sent on a connection the
+# default, as long as httpx kept idle connections), so a request sent on a connection the
 # server is closing fails with a ReadError; job 13956488 died that way at N = 256.
 # launch_servers.sh raises the server's limit, the client gives up its idle
 # connections well before that, and a request whose connection drops is resent.
@@ -46,13 +46,67 @@ def http_client(timeout: float, transport: httpx.AsyncBaseTransport | None = Non
                 ) -> httpx.AsyncClient:
     """Return a client with no connection cap and a shorter keep-alive than the servers'.
 
-    httpx allows 100 connections by default, which would cap a level at 100 beams.
+    Requests go out through aiohttp (AiohttpTransport); tests pass a MockTransport.
     """
-    limits = httpx.Limits(max_connections=None, max_keepalive_connections=None,
-                          keepalive_expiry=CLIENT_KEEP_ALIVE_S)
-    if transport is None:
-        transport = httpx.AsyncHTTPTransport(retries=3, limits=limits)
-    return httpx.AsyncClient(timeout=timeout, transport=transport, limits=limits)
+    return httpx.AsyncClient(timeout=timeout, transport=transport or AiohttpTransport())
+
+
+class AiohttpTransport(httpx.AsyncBaseTransport):
+    """Send httpx requests through one aiohttp session, mapping its errors to httpx's.
+
+    httpx's own pool (httpcore 1.0.9) matches every waiting request against every
+    connection, in Python, each time a request starts or ends. With a level's 256
+    requests in flight on reused connections that cost 30 ms of client CPU per
+    request, one at a time: levels ran at about 30 requests a second per server
+    while the GPU idled (job 14321141). aiohttp's pool costs about 0.1 ms.
+    """
+
+    def __init__(self, keepalive_s: float = CLIENT_KEEP_ALIVE_S) -> None:
+        self._keepalive_s = keepalive_s
+        self._session = None  # made on first use, inside the running loop
+
+    def _get_session(self):
+        import aiohttp
+
+        if self._session is None:
+            connector = aiohttp.TCPConnector(limit=0, keepalive_timeout=self._keepalive_s)
+            # httpx decodes the body from the headers it is given, so aiohttp must not.
+            self._session = aiohttp.ClientSession(connector=connector, auto_decompress=False,
+                                                  timeout=aiohttp.ClientTimeout(total=None))
+        return self._session
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        import aiohttp
+
+        limits = request.extensions.get("timeout", {})
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=limits.get("connect"),
+                                        sock_read=limits.get("read"))
+        headers = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in request.headers.raw
+                   if k.lower() not in (b"host", b"content-length", b"transfer-encoding")]
+        try:
+            async with self._get_session().request(
+                    request.method, str(request.url), headers=headers,
+                    data=await request.aread(), timeout=timeout, allow_redirects=False) as reply:
+                content = await reply.read()
+                return httpx.Response(reply.status, headers=list(reply.raw_headers),
+                                      content=content, request=request)
+        except aiohttp.ConnectionTimeoutError as e:
+            raise httpx.ConnectTimeout(str(e), request=request) from e
+        except (aiohttp.ServerTimeoutError, TimeoutError) as e:
+            raise httpx.ReadTimeout(str(e) or "timed out", request=request) from e
+        except aiohttp.ClientConnectorError as e:
+            raise httpx.ConnectError(str(e), request=request) from e
+        except (aiohttp.ServerDisconnectedError, aiohttp.ClientResponseError) as e:
+            raise httpx.RemoteProtocolError(str(e), request=request) from e
+        except (aiohttp.ClientPayloadError, aiohttp.ClientOSError) as e:
+            raise httpx.ReadError(str(e), request=request) from e
+        except aiohttp.ClientError as e:
+            raise httpx.TransportError(str(e), request=request) from e
+
+    async def aclose(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
 
 
 async def post_json(client: httpx.AsyncClient, url: str, body: dict,

@@ -268,6 +268,7 @@ class MockBackend:
         self._ticker: asyncio.Task[None] | None = None
         self._prefill_s = 0.0
         self._prm_lock = asyncio.Lock()
+        self._prm_busy = False
         self._scores = 0
         self._clock = clock or SimClock()
         self._started = time.perf_counter()
@@ -317,6 +318,8 @@ class MockBackend:
         while batch := [job for job in self._jobs.values() if job.joined]:
             context = sum(job.context for job in batch) / len(batch)
             seconds = self._cost.decode(len(batch), context) + self._prefill_s
+            if self._prm_busy:  # the PRM has the GPU too
+                seconds *= 1 + self._cost.gen_slowdown
             self._prefill_s = 0.0
             if self._chaos:
                 seconds *= 1 + self._jitter.random() * self._chaos.jitter
@@ -362,7 +365,14 @@ class MockBackend:
             tokens += len(ids) - self._prm_cache.cached(ids)
             self._prm_cache.add(ids)
         async with self._prm_lock:
-            await self._elapse(tokens * self._cost.prm_s_per_token)
+            seconds = tokens * self._cost.prm_s_per_token
+            if any(job.joined for job in self._jobs.values()):  # the generator has the GPU too
+                seconds *= 1 + self._cost.prm_slowdown
+            self._prm_busy = True
+            try:
+                await self._elapse(seconds)
+            finally:
+                self._prm_busy = False
         return [mock_score(ids) for ids in prm_ids]
 
     def abort(self, beam_id: str) -> None:

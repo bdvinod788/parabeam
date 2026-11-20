@@ -10,7 +10,8 @@
 # --ntasks-per-node=2 to pack them. Settings, through --export=ALL,NAME=value:
 # PB_MODE (levelsync or async), PB_SUBSET (weak), PB_LIMIT (20), PB_N (256),
 # PB_PLACEMENT (keep_local, level-sync only), PB_RUNS (~/parabeam/runs), and for
-# async PB_CAP (none), PB_EARLY (1.0), PB_STEAL (1). Resubmitting the same
+# async PB_CAP (none), PB_EARLY (1.0), PB_STEAL (1), PB_SCORE (each or level).
+# Resubmitting the same
 # command resumes.
 #
 #SBATCH --job-name=pb-levelsync
@@ -41,14 +42,15 @@ export PB_MODE="$mode"
 if [[ "$mode" == async ]]; then
     cap="${PB_CAP:-}"
     early="${PB_EARLY:-1.0}"
-    extra=(--early "$early")
+    score="${PB_SCORE:-each}"
+    extra=(--early "$early" --score "$score")
     [[ -n "$cap" ]] && extra+=(--cap "$cap")
     steal=""
     if [[ "${PB_STEAL:-1}" == 0 ]]; then
         extra+=(--no-steal)
         steal="-nosteal"
     fi
-    out="$runs/async-$subset$limit-n$n-p$P-cap${cap:-none}-early$early$steal"
+    out="$runs/async-$subset$limit-n$n-p$P-cap${cap:-none}-early$early-score$score$steal"
 elif [[ "$mode" == levelsync ]]; then
     placement="${PB_PLACEMENT:-keep_local}"
     extra=(--placement "$placement")

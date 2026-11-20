@@ -2,7 +2,9 @@
 
 calibrate.py measures these on an A100 and writes cost_model.json. A100 is the
 measurement from job 14346028 (Nov 19), the first taken with a client fast enough
-to fill a batch of 256; the mock replays it by default. GUESS was the stand-in
+to fill a batch of 256; the mock replays it by default. Its two overlap slowdowns
+were fitted on Nov 20 to the first async GPU run (job 14398026), the only run that
+generated and scored on one GPU at once; they are an estimate from one run. GUESS was the stand-in
 before any measurement and is kept only for tests.
 """
 from __future__ import annotations
@@ -29,6 +31,11 @@ class CostModel:
     decode_s: tuple[tuple[float, ...], ...]  # decode_s[c][b]: one decode step, whole batch
     prefill_s: tuple[float, ...]  # prefill_s[c]: prefilling contexts[c] tokens
     prm_s_per_token: float  # scoring one token the PRM has not cached
+    # The generator and the PRM share a GPU. While the PRM scores, a decode step takes
+    # 1 + gen_slowdown times as long; while the generator has requests running, scoring
+    # takes 1 + prm_slowdown times as long. Schedulers that never overlap them pay neither.
+    gen_slowdown: float = 0.0
+    prm_slowdown: float = 0.0
 
     def __post_init__(self) -> None:
         rows = {len(row) for row in self.decode_s}
@@ -55,6 +62,8 @@ class CostModel:
             decode_s=tuple(tuple(row) for row in data["decode_s"]),
             prefill_s=tuple(data["prefill_s"]),
             prm_s_per_token=data["prm_s_per_token"],
+            gen_slowdown=data.get("gen_slowdown", 0.0),
+            prm_slowdown=data.get("prm_slowdown", 0.0),
         )
 
 

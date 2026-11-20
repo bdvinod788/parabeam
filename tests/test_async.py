@@ -20,6 +20,8 @@ OPTIONS = {
     "early": AsyncOptions(steal=False, early=1.0),
     "all, cap 4": AsyncOptions(cap=4, early=1.0),
     "all, no cap, eager": AsyncOptions(early=2.0, early_after=0.0),
+    "level scoring": AsyncOptions(steal=False, early=0, score="level"),
+    "level scoring, all, cap 4": AsyncOptions(cap=4, early=1.0, score="level"),
 }
 
 
@@ -126,22 +128,37 @@ def test_no_early_starts_when_switched_off():
     assert sum(s.early_started for s in run.ranks) == 0
 
 
-def test_async_beats_level_sync_on_the_mock():
+def level_sync_seconds(problem_id, ranks, cfg):
     from parabeam.dist import levelsync
 
+    clock = SimClock()
+
+    async def rank_main(comm):
+        backend = MockBackend(clock=clock)
+        return await levelsync.search(mock_problem(problem_id), cfg, backend, comm,
+                                      "keep_local", backend.now, backend.advance_to)
+
+    return asyncio.run(run_local(ranks, rank_main))[0].result.seconds
+
+
+def test_scoring_whole_levels_without_early_starts_is_level_sync():
     cfg = replace(CFG, N=64)
+    run = spread(17, 4, AsyncOptions(steal=False, early=0, score="level"), cfg=cfg)[0]
+    assert run.result.seconds == pytest.approx(level_sync_seconds(17, 4, cfg), rel=1e-6)
 
-    def level_sync_seconds():
-        clock = SimClock()
 
-        async def rank_main(comm):
-            backend = MockBackend(clock=clock)
-            return await levelsync.search(mock_problem(17), cfg, backend, comm, "keep_local",
-                                          backend.now, backend.advance_to)
+def test_early_starts_fill_the_wait_at_the_barrier():
+    cfg = replace(CFG, N=64)
+    runs = [spread(p, 4, AsyncOptions(steal=False, early=1.0, score="level"), cfg=cfg)[0]
+            for p in PROBLEMS]
+    assert sum(r.result.seconds for r in runs) < sum(level_sync_seconds(p, 4, cfg)
+                                                     for p in PROBLEMS)
 
-        return asyncio.run(run_local(4, rank_main))[0].result.seconds
 
-    assert spread(17, 4, AsyncOptions(), cfg=cfg)[0].result.seconds < level_sync_seconds()
+def test_scoring_while_generating_costs_time_on_a_shared_gpu():
+    cfg = replace(CFG, N=64)
+    each = spread(17, 1, AsyncOptions(steal=False, early=0), cfg=cfg)[0].result.seconds
+    assert each > level_sync_seconds(17, 1, cfg)
 
 
 def test_options_are_checked():
@@ -151,3 +168,5 @@ def test_options_are_checked():
         AsyncOptions(early=-1)
     with pytest.raises(ValueError):
         AsyncOptions(early_after=2)
+    with pytest.raises(ValueError):
+        AsyncOptions(score="sometimes")

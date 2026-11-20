@@ -8,7 +8,8 @@ and must keep exactly the serial search's beams; a mismatch stops the run. One
 JSON line per (variant, P, problem) goes to --out; the table at the end gives
 each variant's mean seconds per problem and per level, and its speedup over the
 serial search. On Nov 19 the mock's level-sync matched the GPU's seconds per
-level within 4% at P = 1, 2 and 4.
+level within 4% at P = 1, 2 and 4; on Nov 20 the generator/PRM overlap slowdown
+was fitted to the first async GPU run (see dist/cost_model_a100.json).
 """
 from __future__ import annotations
 
@@ -26,15 +27,16 @@ from parabeam.dist.async_sched import AsyncOptions
 VARIANTS: dict[str, AsyncOptions | str] = {
     "levelsync": "keep_local",
     "levelsync-rr": "round_robin",
-    "overlap": AsyncOptions(steal=False, early=0),
-    "overlap+early": AsyncOptions(steal=False, early=1.0),
-    "async": AsyncOptions(early=1.0),
-    "cap64": AsyncOptions(cap=64, steal=False, early=0),
-    "cap64+steal": AsyncOptions(cap=64, early=0),
-    "cap64+early": AsyncOptions(cap=64, steal=False, early=1.0),
-    "async-cap64": AsyncOptions(cap=64, early=1.0),
-    "async-cap32": AsyncOptions(cap=32, early=1.0),
-    "async-early2": AsyncOptions(early=2.0),
+    # Scoring each child as it finishes, as in the first GPU pilot (job 14398026).
+    "each": AsyncOptions(steal=False, early=0),
+    "each+early-cap64": AsyncOptions(cap=64, early=1.0),
+    # Scoring a rank's whole level at once, so the PRM never shares the GPU with generation.
+    "level": AsyncOptions(steal=False, early=0, score="level"),
+    "level+steal-cap64": AsyncOptions(cap=64, early=0, score="level"),
+    "level+early": AsyncOptions(steal=False, early=1.0, score="level"),
+    "level+early-cap64": AsyncOptions(cap=64, steal=False, early=1.0, score="level"),
+    "level+early+steal-cap64": AsyncOptions(cap=64, early=1.0, score="level"),
+    "level+early2": AsyncOptions(steal=False, early=2.0, score="level"),
 }
 
 

@@ -56,5 +56,8 @@
   0.034707446582615376
  ],
  "prm_s_per_token": 7.264240609947592e-05,
- "source": "slurm job 14346028, commit c366a83, A100-PCIE-40GB, vLLM 0.32.0, served timers"
+ "source": "slurm job 14346028, commit c366a83, A100-PCIE-40GB, vLLM 0.32.0, served timers",
+ "gen_slowdown": 3.4,
+ "prm_slowdown": 1.0,
+ "overlap_source": "fitted Nov 20 so the mock's async P=1 (cap 64, early 1.0) matches job 14398026: 4.02 s per level and 14.8 ms per token per request; prm_slowdown from the Nov 9 measurement (scoring 1.94 s vs 0.96 s with the generator busy)"
 }

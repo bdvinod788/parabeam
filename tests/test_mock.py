@@ -539,6 +539,20 @@ def test_stalls_hold_requests_longer():
     assert asyncio.run(held(1.0)) > asyncio.run(held(0.0)) > 0
 
 
+def test_scoring_slows_generation_on_the_same_gpu_and_back():
+    async def run(overlap):
+        backend = MockBackend()
+        gen = asyncio.ensure_future(backend.generate(request(0, max_tokens=400)))
+        if overlap:
+            await asyncio.sleep(0)
+            await backend.score([list(range(4000))])
+        await gen
+        return backend.now()
+
+    alone = asyncio.run(run(False)) + 4000 * A100.prm_s_per_token
+    assert asyncio.run(run(True)) > alone
+
+
 def test_a_shared_clock_orders_work_across_backends():
     async def run():
         clock = SimClock()

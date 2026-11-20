@@ -5,9 +5,14 @@ Selection stays global and exact: each level still ends in one allgather of
 exactly the beams the serial search keeps. What changes is how a rank spends a
 level, in three parts that can be switched off one at a time for the ablation:
 
-- Scoring overlaps generation (always on). Each child is scored as soon as it is
-  generated, in one PRM call with whatever else finished while the PRM was busy,
-  instead of all together after the level's longest step.
+- Scoring overlaps generation (score="each"). Each child is scored as soon as it
+  is generated, in one PRM call with whatever else finished while the PRM was
+  busy, instead of all together after the level's longest step. On a GPU that
+  also runs the generator this costs more than it saves: in job 14398026 decode
+  steps ran about 4.4 times slower while the PRM scored, so async at P = 1 took
+  4.02 s per level against level-sync's 2.73. With score="level" a rank scores
+  its children of a level in one call once they are all generated, as level-sync
+  does, and keeps the other two parts.
 - Stealing. Work waits in a rank-local queue with at most `cap` requests
   generating at once. A rank with nothing queued asks the others in turn and
   takes half of a queue, its worst-ranked units first, parents included.
@@ -56,8 +61,11 @@ class AsyncOptions:
     steal: bool = True
     early: float = 1.0  # parents a rank may start early, in shares of N / (M * P); 0 for none
     early_after: float = 0.5  # share of its own children scored before a rank starts early
+    score: str = "each"  # "each": as children finish; "level": once a rank's level is generated
 
     def __post_init__(self) -> None:
+        if self.score not in ("each", "level"):
+            raise ValueError(f"score must be 'each' or 'level', got {self.score!r}")
         if self.cap is not None and self.cap < 1:
             raise ValueError(f"cap must be positive, got {self.cap}")
         if self.early < 0 or not 0 <= self.early_after <= 1:
@@ -107,7 +115,7 @@ class _Work(NamedTuple):
 
 
 class _Child(NamedTuple):
-    beam: Beam  # scored
+    beam: Beam  # scored, unless the rank scores whole levels
     step: Step
 
 
@@ -192,9 +200,10 @@ class _Rank:
         finally:
             self._release(slot)
         child = e.parent.child(e.index, out, self.backend.prm_step_ids(out))
-        score = await self.scorer.score(child.prm_ids)
-        return _Child(child.scored(score),
-                      Step(len(out.token_ids), out.finish, out.t_end - out.t_start))
+        step = Step(len(out.token_ids), out.finish, out.t_end - out.t_start)
+        if self.opts.score == "level":
+            return _Child(child, step)  # scored with the rest of its level
+        return _Child(child.scored(await self.scorer.score(child.prm_ids)), step)
 
     def _start(self, work: _Work) -> list[asyncio.Task[_Child]]:
         """Start a unit's children. Each holds a slot from now until its step is generated,
@@ -332,7 +341,8 @@ class _Rank:
                 if got:
                     stolen += got
                     continue
-            if early_ok and not self.queue and len(children) >= self.opts.early_after * own:
+            if early_ok and self.opts.score == "each" and not self.queue \
+                    and len(children) >= self.opts.early_after * own:
                 self._start_early(children, budget)
             if not tasks:
                 break
@@ -340,6 +350,11 @@ class _Rank:
             waiter = asyncio.ensure_future(self.changed.wait())
             await asyncio.wait({*tasks, waiter}, return_when=asyncio.FIRST_COMPLETED)
             waiter.cancel()
+        if self.opts.score == "level" and children:
+            # Nothing of this rank's is generating now, so the PRM has the GPU to itself.
+            beams = list(children.values())
+            scores = await self.backend.score([b.prm_ids for b in beams])
+            children = {b.path: b.scored(x) for b, x in zip(beams, scores, strict=True)}
         if early_ok:
             self._start_early(children, budget)  # every child is scored now: top up
         return children, steps, stolen, sum(len(t) for t in self.early.values())
@@ -486,11 +501,12 @@ def main() -> None:
     parser.add_argument("--no-steal", action="store_true")
     parser.add_argument("--early", type=float, default=1.0)
     parser.add_argument("--early-after", type=float, default=0.5)
+    parser.add_argument("--score", default="each", choices=["each", "level"])
     parser.add_argument("--chaos", type=int, help="seed for chaos timing and delivery")
     args = parser.parse_args()
 
     cfg = SearchConfig(args.N, args.M, args.max_depth, args.max_step_tokens)
-    opts = AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after)
+    opts = AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after, args.score)
     ids = json.loads(SUBSETS_PATH.read_text())["math500"]["subsets"][args.subset][: args.limit]
 
     def line(problem_id: int, run: AsyncResult, serial: SearchResult) -> tuple[bool, str]:

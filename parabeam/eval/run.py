@@ -259,8 +259,8 @@ async def levelsync_rank(args, comm) -> int:
     from parabeam.dist import async_sched, levelsync
 
     is_async = args.mode == "async"
-    opts = (async_sched.AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after)
-            if is_async else None)
+    opts = (async_sched.AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after,
+                                     args.score) if is_async else None)
 
     cfg = SearchConfig(args.N, args.M, args.max_depth, args.max_step_tokens)
     vllm = args.backend == "vllm"
@@ -272,7 +272,7 @@ async def levelsync_rank(args, comm) -> int:
               "placement": args.placement}
     if is_async:
         config.update({"cap": opts.cap, "steal": opts.steal, "early": opts.early,
-                       "early_after": opts.early_after})
+                       "early_after": opts.early_after, "score": opts.score})
     backend, to_problem, clock = make_backend(args)
     sync = getattr(backend, "advance_to", None) if not vllm else None
     me = {"rank": comm.rank, "host": socket.gethostname(),
@@ -522,6 +522,8 @@ def main() -> None:
     p.add_argument("--early", type=float, default=1.0,
                    help="parents a rank may start early, in shares of N / (M * P); 0 for none")
     p.add_argument("--early-after", type=float, default=0.5)
+    p.add_argument("--score", default="each", choices=["each", "level"],
+                   help="score each child as it finishes, or a rank's whole level at once")
     args = parser.parse_args()
     needs_servers = args.mode == "greedy" or args.backend == "vllm"
     if needs_servers and not (args.gen_url and args.prm_url):

@@ -32,6 +32,8 @@ T = TypeVar("T")
 
 POLL_S = 0.001  # how often a waiting rank polls MPI
 MOVE = 1  # tag: beams sent to the rank that expands them
+STEAL = 2  # tag: an idle rank asks another for queued work
+GIVE = 3  # tag: the answer to STEAL
 
 
 class Comm(Protocol):
@@ -132,8 +134,17 @@ class MpiComm:
 
     async def recv(self, tag: int) -> tuple[int, Any]:
         pump = self._start_pump()
-        get = asyncio.ensure_future(self._inbox[tag].get())
-        await asyncio.wait({get, pump}, return_when=asyncio.FIRST_COMPLETED)
+        inbox = self._inbox[tag]
+        get = asyncio.ensure_future(inbox.get())
+        try:
+            await asyncio.wait({get, pump}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            # Left running, the getter would take the next message for nobody: the
+            # async scheduler's steal server is cancelled after every problem.
+            if get.done() and not get.cancelled():
+                inbox.put_nowait(get.result())
+            get.cancel()
+            raise
         if not get.done():  # the pump died; raise its error rather than hang
             get.cancel()
             pump.result()

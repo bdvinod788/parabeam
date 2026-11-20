@@ -64,3 +64,13 @@ def test_the_run_driver_over_mpi(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 2
     assert sorted(p.name for p in (tmp_path / "ranks").iterdir()) == ["rank-0.jsonl", "rank-1.jsonl"]
+
+
+@pytest.mark.parametrize(
+    ("ranks", "extra"),
+    [(1, []), (2, ["--cap", "4"]), (4, ["--cap", "4", "--chaos", "3"])],
+)
+def test_async_matches_serial_over_mpi(ranks, extra):
+    done = launch(ranks, "-m", "parabeam.dist.async_sched", "--limit", "2", "--N", "16", *extra)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"2 of 2 match the serial search, P={ranks}" in done.stdout

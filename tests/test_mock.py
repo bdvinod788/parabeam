@@ -9,20 +9,23 @@ import pytest
 from parabeam.backends.base import Aborted, GenReq
 from parabeam.backends.mock import (
     EXTRA_0,
+    LEVEL_STEPS,
     PROBLEM_STEPS,
     STEP_TOKENS,
     STOP_SPREAD,
     Chaos,
     MockBackend,
     PrefixCache,
+    SimClock,
+    level_steps,
     mock_problem,
     mock_score,
     mock_step,
     stop_chance,
 )
 from parabeam.core.seeding import child_seed, path_key
-from parabeam.dist.costmodel import GUESS, CostModel
-from parabeam.tools.fit_steps import fit, inverse_cdf
+from parabeam.dist.costmodel import A100, GUESS, CostModel
+from parabeam.tools.fit_steps import fit, inverse_cdf, logged_levels, refit_step_tokens
 
 
 def request(index=0, level=3, problem=17, max_tokens=2048, final=False, prefix=None):
@@ -49,17 +52,49 @@ def test_outputs_depend_only_on_the_request():
     assert mock_step(request(1)) != mock_step(request(2))
 
 
-def test_step_lengths_follow_prm800k():
-    lengths = sorted(len(mock_step(r)[0]) for r in requests(20000, level=1, problem=10**6))
-    assert statistics.median(lengths) == pytest.approx(STEP_TOKENS[500], abs=2)
-    assert lengths[19800] == pytest.approx(STEP_TOKENS[990], rel=0.15)
-    assert statistics.mean(lengths) == pytest.approx(statistics.mean(STEP_TOKENS), rel=0.05)
+def test_a_level_draws_its_steps_from_one_logged_level():
+    steps = level_steps(10**6, 1)
+    lengths = sorted(len(mock_step(r)[0]) for r in requests(5000, level=1, problem=10**6))
+    assert set(lengths) <= set(steps)
+    assert statistics.median(lengths) == pytest.approx(steps[32], rel=0.25, abs=3)
+    assert lengths[-1] <= steps[-1]
+
+
+def test_step_lengths_over_many_levels_follow_the_logged_steps():
+    lengths = sorted(len(mock_step(request(index=i % 64, level=1 + i // 64 % 30,
+                                           problem=10**6 + i // 1920))[0])
+                     for i in range(20000))
+    assert statistics.median(lengths) == pytest.approx(STEP_TOKENS[500], rel=0.3)
+    assert statistics.mean(lengths) == pytest.approx(statistics.mean(STEP_TOKENS), rel=0.3)
+
+
+def test_levels_differ_but_their_longest_steps_are_rarely_extreme():
+    longest = sorted(level[-1] for level in LEVEL_STEPS)
+    assert len(LEVEL_STEPS) > 500
+    assert longest[len(longest) // 2] < STEP_TOKENS[995]  # unlike 256 independent draws
+    assert len({tuple(level) for level in LEVEL_STEPS}) > len(LEVEL_STEPS) // 2
 
 
 def test_step_statistics_are_sane():
     assert STEP_TOKENS == sorted(STEP_TOKENS) and PROBLEM_STEPS == sorted(PROBLEM_STEPS)
+    assert all(level == sorted(level) and level[0] >= 1 for level in LEVEL_STEPS)
     assert STEP_TOKENS[0] >= 1 and PROBLEM_STEPS[0] >= 1
     assert STOP_SPREAD >= 1
+
+
+def test_logged_levels_merge_ranks_and_skip_the_last_level(tmp_path):
+    ranks = tmp_path / "run" / "ranks"
+    ranks.mkdir(parents=True)
+    line = lambda rank, level, tokens: json.dumps(
+        {"id": 7, "job": "1", "rank": rank, "level": level,
+         "steps": [[t, "stop", 0.1] for t in tokens]})
+    (ranks / "rank-0.jsonl").write_text("\n".join([line(0, 1, [5, 0]), line(0, 40, [999])]) + "\n")
+    (ranks / "rank-1.jsonl").write_text(line(1, 1, [9]) + "\n")
+    levels = logged_levels([tmp_path / "run"])
+    assert levels == [[5, 1, 9]]
+    stats = refit_step_tokens({"problem_steps": [3]}, levels, "test")
+    assert stats["problem_steps"] == [3] and stats["steps"] == 3
+    assert stats["level_steps"][0][0] == 1 and stats["level_steps"][0][-1] == 9
 
 
 @pytest.mark.parametrize("problem", range(50))
@@ -188,13 +223,14 @@ def test_a_cached_prefix_is_not_prefilled_again():
         return backend.now() - start
 
     async def both():
-        backend = MockBackend()
-        cold = await run(backend, request(0, prefix=prefix))
-        warm = await run(backend, request(0, level=4, prefix=prefix))
+        cold = await run(MockBackend(), request(0, prefix=prefix))
+        warmed = MockBackend()
+        await warmed.generate(request(1, prefix=prefix))  # a sibling: same prefix
+        warm = await run(warmed, request(0, prefix=prefix))
         return cold, warm
 
     cold, warm = asyncio.run(both())
-    assert cold - warm == pytest.approx(GUESS.prefill(1600), rel=0.5)
+    assert cold - warm == pytest.approx(A100.prefill(1600), rel=0.05)
 
 
 def test_scoring_charges_only_new_tokens():
@@ -206,8 +242,8 @@ def test_scoring_charges_only_new_tokens():
         return first, backend.now() - first
 
     first, repeat = asyncio.run(run())
-    assert first == pytest.approx(1000 * GUESS.prm_s_per_token)
-    assert repeat == pytest.approx(8 * GUESS.prm_s_per_token)  # past the last whole block
+    assert first == pytest.approx(1000 * A100.prm_s_per_token)
+    assert repeat == pytest.approx(8 * A100.prm_s_per_token)  # past the last whole block
 
 
 def test_prefix_cache_matches_whole_leading_blocks():
@@ -271,7 +307,7 @@ def test_aborting_a_finished_or_unknown_request_does_nothing():
 
 def test_an_aborted_request_stops_costing_time():
     async def run(abort):
-        backend = MockBackend()
+        backend = MockBackend(GUESS)  # on the A100 a batch of 1 is no faster than 2
         long, short = request(0, max_tokens=4, level=1), request(1, max_tokens=4, level=1)
         tasks = [asyncio.create_task(backend.generate(r)) for r in (long, short)]
         await asyncio.sleep(0)
@@ -319,7 +355,7 @@ def test_scale_sleeps_for_real():
         return time.perf_counter() - start, backend.now()
 
     wall, simulated = asyncio.run(run())
-    assert wall >= 1000 * GUESS.prm_s_per_token * 0.2 * 0.9
+    assert wall >= 1000 * A100.prm_s_per_token * 0.2 * 0.9
     assert simulated == pytest.approx(wall / 0.2, rel=0.5)
 
 
@@ -339,9 +375,18 @@ def test_costs_beyond_the_measurements():
     assert cost.prefill(2000) == 2.0
 
 
-def test_the_guess_is_monotonic():
-    times = [GUESS.decode(batch, 1000) for batch in (1, 8, 64, 256, 512)]
+@pytest.mark.parametrize("cost", [GUESS, A100])
+def test_decode_slows_with_batch_and_context(cost):
+    times = [cost.decode(batch, 1000) for batch in (8, 16, 64, 256, 512)]
     assert times == sorted(times)
+    assert cost.decode(1, 1000) <= cost.decode(16, 1000)
+    assert cost.decode(256, 500) < cost.decode(256, 2000)
+
+
+def test_the_a100_measurement_is_what_the_mock_replays():
+    assert MockBackend()._cost is A100
+    assert A100.decode(1, 1000) == pytest.approx(0.0043, rel=0.05)
+    assert A100.decode(256, 2000) == pytest.approx(0.0163, rel=0.05)
 
 
 def test_cost_model_loads_what_calibrate_will_write(tmp_path):
@@ -486,16 +531,40 @@ def test_the_chaos_seed_sets_the_arrival_order():
 
 
 def test_stalls_hold_requests_longer():
-    async def turns(stall_chance):
+    async def held(stall_chance):
         backend = MockBackend(chaos=Chaos(5, max_hold=16, stall_chance=stall_chance))
-        hold = asyncio.create_task(backend._hold("key"))
-        count = 0
-        while not hold.done():
-            await asyncio.sleep(0)
-            count += 1
-        return count
+        await backend._hold("key")
+        return backend.now()  # a hold costs simulated time as well as loop turns
 
-    assert asyncio.run(turns(1.0)) > asyncio.run(turns(0.0))
+    assert asyncio.run(held(1.0)) > asyncio.run(held(0.0)) > 0
+
+
+def test_a_shared_clock_orders_work_across_backends():
+    async def run():
+        clock = SimClock()
+        fast, slow = MockBackend(clock=clock), MockBackend(clock=clock)
+        order = []
+
+        async def one(backend, name, tokens):
+            await backend.generate(request(0, max_tokens=tokens, problem=hash(name) % 997))
+            order.append((name, clock.now))
+
+        await asyncio.gather(one(slow, "slow", 400), one(fast, "fast", 4))
+        return order, fast.now(), slow.now()
+
+    order, fast_now, slow_now = asyncio.run(run())
+    assert [name for name, _ in order] == ["fast", "slow"]
+    assert order[0][1] < order[1][1] and fast_now == slow_now
+
+
+def test_separate_clocks_in_one_loop_both_advance():
+    async def run():
+        a, b = MockBackend(), MockBackend()
+        await asyncio.gather(a.generate(request(0)), b.generate(request(1)))
+        return a.now(), b.now()
+
+    a_now, b_now = asyncio.run(run())
+    assert a_now > 0 and b_now > 0
 
 
 def test_prefix_cache_keeps_what_was_used_recently():

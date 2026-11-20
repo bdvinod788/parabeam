@@ -4,7 +4,9 @@
     python -m parabeam.tools.gantt RUN_DIR            # the slowest problem
 
 The top panel has one row per rank: for each level, the time spent receiving
-moved beams, generating, scoring, and waiting in the allgather. The bottom panel
+moved beams, generating, scoring, and waiting in the allgather. Async runs score
+while they generate, so their levels show one "generate + score" span; their
+wait can hold early starts of the next level. The bottom panel
 counts each rank's requests still generating, which shows how much of a level
 is a few long steps. Needs matplotlib, which the CARC environment leaves out;
 copy the run directory and plot locally.
@@ -18,8 +20,12 @@ from itertools import pairwise
 from pathlib import Path
 
 PHASES = ("move", "generate", "score", "wait")
-# Validated categorical slots 1-3 (dataviz palette), and gray for idle time.
-COLORS = {"move": "#1baf7a", "generate": "#2a78d6", "score": "#eb6834", "wait": "#c3c2b7"}
+ASYNC_PHASES = ("move", "work", "wait")  # async logs have four marks, not five
+# Validated categorical slots 1-3 (dataviz palette), and gray for idle time. An
+# async chart never has generate and work together, so they share a colour.
+COLORS = {"move": "#1baf7a", "generate": "#2a78d6", "score": "#eb6834", "wait": "#c3c2b7",
+          "work": "#2a78d6"}
+LABELS = {"work": "generate + score"}
 # Ranks use other validated slots, so a rank never shares a phase's color.
 RANK_COLORS = ("#6250d6", "#eda100", "#e87ba4", "#008300")
 INK, MUTED, GRID = "#1f1f1e", "#6b6a64", "#e6e5df"
@@ -50,14 +56,16 @@ def spans(lines: list[dict]) -> list[Span]:
     out = []
     for line in lines:
         marks = line["marks"]
-        for phase, (start, stop) in zip(PHASES, pairwise(marks), strict=True):
+        phases = ASYNC_PHASES if len(marks) == len(ASYNC_PHASES) + 1 else PHASES
+        for phase, (start, stop) in zip(phases, pairwise(marks), strict=True):
             out.append(Span(line["rank"], line["level"], phase, start, stop))
     return out
 
 
 def running(lines: list[dict], rank: int) -> list[tuple[float, int]]:
     """(time, requests still generating) steps for one rank; requests start at their level's
-    generate mark."""
+    generate mark. An async step started early really began before that mark, so for
+    async runs the count is approximate and can exceed the cap."""
     events = []
     for line in lines:
         if line["rank"] != rank:
@@ -100,7 +108,8 @@ def draw(lines: list[dict], title: str, out: Path) -> None:
     fig, (top, bottom) = plt.subplots(
         2, 1, sharex=True, figsize=(11, 1.2 + 0.55 * len(ranks) + 2.4),
         gridspec_kw={"height_ratios": [max(1.5, 0.55 * len(ranks)), 2.2]})
-    for span in spans(lines):
+    drawn = spans(lines)
+    for span in drawn:
         if span.stop > span.start:
             # A 2 px gap between neighbouring bars comes from the white edge.
             top.barh(span.rank, span.stop - span.start, left=span.start, height=0.6,
@@ -108,7 +117,9 @@ def draw(lines: list[dict], title: str, out: Path) -> None:
     top.set_yticks(ranks, [f"rank {r}" for r in ranks])
     top.invert_yaxis()
     top.set_title(title, loc="left", color=INK, fontsize=11)
-    top.legend(handles=[Patch(color=COLORS[p], label=p) for p in PHASES], ncols=4,
+    shown = list(dict.fromkeys(span.phase for span in drawn))
+    top.legend(handles=[Patch(color=COLORS[p], label=LABELS.get(p, p)) for p in shown],
+               ncols=len(shown),
                loc="lower left", bbox_to_anchor=(0, 1.08), frameon=False, fontsize=9)
 
     for rank in ranks:
@@ -146,8 +157,10 @@ def main() -> None:
               else next(r for r in records if r["id"] == args.id))
     lines = read_logs(args.run, record["id"], args.job)
     manifest = json.loads((args.run / "manifest.json").read_text())["config"]
+    how = (f"async, cap {manifest.get('cap')}, early {manifest.get('early')}"
+           if manifest.get("mode") == "async" else manifest["placement"])
     title = (f"problem {record['id']}, P={manifest['P']}, N={manifest['N']}, "
-             f"{manifest['placement']}: {record['seconds']:.1f} s, {record['levels']} levels")
+             f"{how}: {record['seconds']:.1f} s, {record['levels']} levels")
     out = args.out or args.run / f"gantt-{record['id']}.png"
     draw(lines, title, out)
     print(f"wrote {out}")

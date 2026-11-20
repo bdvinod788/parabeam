@@ -143,3 +143,31 @@ def test_local_ranks_need_the_mock(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exit_:
         run.main()
     assert exit_.value.code == 2
+
+
+def run_async(monkeypatch, out, ranks=4, *extra):
+    argv = ["run", "async", "--backend", "mock", "--local", str(ranks), "--subset", "pilot",
+            "--limit", "3", "--N", "16", "--M", "4", "--cap", "4", "--out", str(out), *extra]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exit_:
+        run.main()
+    return exit_.value.code
+
+
+def test_async_runs_match_serial_runs_and_log_their_counters(monkeypatch, tmp_path):
+    serial = go(monkeypatch, tmp_path / "serial")
+    assert run_async(monkeypatch, tmp_path / "as") == 0
+    records = lines(tmp_path / "as" / run.RESULTS)
+    assert [r["fingerprint"] for r in records] == [r["fingerprint"] for r in serial]
+    assert all({"stolen", "early_started", "early_kept"} <= set(r) for r in records)
+    config = json.loads((tmp_path / "as" / run.MANIFEST).read_text())["config"]
+    assert config["mode"] == "async" and config["cap"] == 4 and config["steal"] is True
+    for rank in range(4):
+        for line in lines(tmp_path / "as" / "ranks" / f"rank-{rank}.jsonl"):
+            assert len(line["marks"]) == 4 and line["marks"] == sorted(line["marks"])
+            assert len(line["steps"]) == line["requests"]
+
+
+def test_async_and_level_sync_runs_do_not_share_a_directory(monkeypatch, tmp_path):
+    assert levelsync(monkeypatch, tmp_path) == 0
+    assert run_async(monkeypatch, tmp_path) == 1  # other settings: refused

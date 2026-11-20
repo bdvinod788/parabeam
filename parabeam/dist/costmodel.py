@@ -1,7 +1,9 @@
 """What each operation costs on a GPU, used by placement and replayed by the mock.
 
-calibrate.py measures these on an A100 and writes them to cost_model.json. Until
-then GUESS stands in, so timing from the mock means nothing yet.
+calibrate.py measures these on an A100 and writes cost_model.json. A100 is the
+measurement from job 14346028 (Nov 19), the first taken with a client fast enough
+to fill a batch of 256; the mock replays it by default. GUESS was the stand-in
+before any measurement and is kept only for tests.
 """
 from __future__ import annotations
 
@@ -70,3 +72,6 @@ GUESS = CostModel(
     # The plan's 10 to 20 s to rescore 256 beams of about 1,000 tokens.
     prm_s_per_token=6e-5,
 )
+
+
+A100 = CostModel.load(Path(__file__).with_name("cost_model_a100.json"))

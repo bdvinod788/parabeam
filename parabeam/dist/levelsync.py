@@ -244,10 +244,11 @@ def _per_level(stats: Sequence[RankLevel]) -> tuple[LevelStats, ...]:
 
 
 async def _mock_rank(comm: Comm, problem_id: int, cfg: SearchConfig, placement: str,
-                     chaos: int | None) -> LevelSyncResult:
+                     chaos: int | None, clock=None) -> LevelSyncResult:
     from parabeam.backends.mock import Chaos, MockBackend, mock_problem
 
-    backend = MockBackend(chaos=None if chaos is None else Chaos(chaos + 1000 * comm.rank))
+    backend = MockBackend(chaos=None if chaos is None else Chaos(chaos + 1000 * comm.rank),
+                          clock=clock)
     return await search(mock_problem(problem_id), cfg, backend, comm, placement,
                         backend.now, backend.advance_to)
 
@@ -292,16 +293,18 @@ def main() -> None:
     cfg = SearchConfig(args.N, args.M, args.max_depth, args.max_step_tokens)
     ids = json.loads(SUBSETS_PATH.read_text())["math500"]["subsets"][args.subset][: args.limit]
 
-    def rank_main(problem_id: int):
-        return lambda comm: _mock_rank(comm, problem_id, cfg, args.placement, args.chaos)
+    def rank_main(problem_id: int, clock=None):
+        return lambda comm: _mock_rank(comm, problem_id, cfg, args.placement, args.chaos, clock)
 
     if args.local:
+        from parabeam.backends.mock import SimClock
         from parabeam.dist.runtime import run_local
 
         size = args.local
         matches = 0
         for problem_id in ids:
-            run = asyncio.run(run_local(size, rank_main(problem_id), args.chaos))[0]
+            # One clock for every rank, as they share one process.
+            run = asyncio.run(run_local(size, rank_main(problem_id, SimClock()), args.chaos))[0]
             same, line = _line(problem_id, run, asyncio.run(_serial(problem_id, cfg)))
             matches += same
             print(line, flush=True)

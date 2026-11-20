@@ -66,6 +66,16 @@ async def comm_checks() -> None:
     else:
         await asyncio.sleep(0.2)
         assert await comm.allgather(1) == [1] * size
+
+    # A cancelled receive must not take the next message with it, as the async
+    # scheduler cancels its steal server after every problem.
+    waiting = asyncio.ensure_future(comm.recv(10))
+    await asyncio.sleep(0.01)
+    waiting.cancel()
+    await comm.allgather(None)
+    await comm.send(rank, (rank + 1) % size, tag=10)
+    source, value = await comm.recv(10)
+    assert (source, value) == ((rank - 1) % size, (rank - 1) % size)
     await comm.close()
     print(f"rank {rank} of {size}: OK", flush=True)
 

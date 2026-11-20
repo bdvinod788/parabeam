@@ -2,21 +2,28 @@
 
 What a request produces depends only on its seed and path, and a score only on
 its token IDs, so results cannot vary with rank, batch or timing. If two policies
-disagree on the mock, the fault is in the policy. Step lengths and solution
-lengths follow PRM800K (see tools/fit_steps.py); time comes from a CostModel.
+disagree on the mock, the fault is in the policy. Step lengths come from the
+generator's own steps on the GPU, one logged level's distribution per level of a
+search, so a level's steps are alike as they are on the GPU; solution lengths
+follow PRM800K (see tools/fit_steps.py). Time comes from a CostModel.
 
 Time passes in decode ticks, as in continuous batching: each tick extends every
 active request by one token and takes t(batch), plus the prefill of any request
-that joined. With scale=0 the clock is simulated and runs as fast as the CPU can.
-With scale>0 the mock really sleeps, for simulated time times scale.
+that joined. With scale=0 time is simulated by a SimClock and runs as fast as the
+CPU can; backends that share one SimClock, as the ranks of a LocalWorld should,
+see one consistent time, so a rank that steals work or starts early does so at
+the right moment in the other ranks' time. With scale>0 the mock really sleeps,
+for simulated time times scale.
 
-Chaos changes when things happen, never what they produce. It counts delays in
-event-loop turns, not seconds, so a failure replays from its seed.
+Chaos changes when things happen, never what they produce. Its delays are drawn
+from its seed, in event-loop turns plus as much simulated time, never in wall
+seconds, so a failure replays from its seed.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import random
 import time
@@ -26,10 +33,11 @@ from pathlib import Path
 
 from parabeam.backends.base import Aborted, Finish, GenReq, StepOut
 from parabeam.core.beam import Problem
-from parabeam.dist.costmodel import GUESS, CostModel
+from parabeam.dist.costmodel import A100, CostModel
 
 _STATS = json.loads(Path(__file__).with_name("step_stats.json").read_text())
-STEP_TOKENS: list[int] = _STATS["step_tokens"]
+STEP_TOKENS: list[int] = _STATS["step_tokens"]  # pooled over every logged step
+LEVEL_STEPS: list[list[int]] = _STATS["level_steps"]  # one distribution per logged level
 PROBLEM_STEPS: list[int] = _STATS["problem_steps"]
 STOP_SPREAD: int = _STATS["stop_spread"]
 
@@ -45,8 +53,13 @@ def _draw(seed: int, salt: str) -> float:
     return int.from_bytes(digest[:8], "big") / 2**64
 
 
-def _step_length(seed: int, salt: str) -> int:
-    return STEP_TOKENS[int(_draw(seed, salt) * len(STEP_TOKENS))]
+def level_steps(problem_id: int, level: int) -> list[int]:
+    """Return the logged level whose step lengths this level of a search draws from."""
+    return LEVEL_STEPS[int(_draw(problem_id * 1000 + level, "level") * len(LEVEL_STEPS))]
+
+
+def _step_length(seed: int, salt: str, steps: list[int]) -> int:
+    return steps[int(_draw(seed, salt) * len(steps))]
 
 
 def stop_chance(problem_id: int, level: int) -> float:
@@ -64,14 +77,15 @@ def stop_chance(problem_id: int, level: int) -> float:
 def mock_step(req: GenReq) -> tuple[list[int], str, Finish]:
     """Return the tokens, text and finish reason of a request."""
     seed = req.seed
-    problem, level_key, _ = req.beam_id.split("/")
+    problem_key, level_key, _ = req.beam_id.split("/")
+    problem, level = int(problem_key.removeprefix("p")), int(level_key.removeprefix("L"))
+    steps = level_steps(problem, level)
     if req.final:
-        length = sum(_step_length(seed, f"length{i}") for i in range(FINAL_STEPS))
+        length = sum(_step_length(seed, f"length{i}", steps) for i in range(FINAL_STEPS))
         stop = True
     else:
-        length = _step_length(seed, "length")
-        chance = stop_chance(int(problem.removeprefix("p")), int(level_key.removeprefix("L")))
-        stop = _draw(seed, "stop") < chance
+        length = _step_length(seed, "length", steps)
+        stop = _draw(seed, "stop") < stop_chance(problem, level)
 
     if length > req.max_tokens:
         length, finish, text = req.max_tokens, "length", f"Step {seed:x}"
@@ -132,12 +146,95 @@ class PrefixCache:
             del self._blocks[next(iter(self._blocks))]
 
 
+class SimClock:
+    """Simulated seconds, advanced only when no task in the event loop can run.
+
+    A task that sleeps on the clock wakes when time reaches its deadline, in
+    deadline order. Time jumps to the next deadline only once every other task is
+    blocked, so work that takes no simulated time, such as messages between ranks
+    in one process, happens at the current instant. Ranks in separate processes
+    each have their own clock and meet with advance_to at barriers.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._sleepers: list[tuple[float, int, asyncio.Future[None]]] = []
+        self._count = 0
+
+    def advance_to(self, t: float) -> None:
+        self.now = max(self.now, t)
+
+    async def sleep(self, seconds: float) -> None:
+        if seconds <= 0:
+            await asyncio.sleep(0)
+            return
+        loop = asyncio.get_running_loop()
+        wake = loop.create_future()
+        self._count += 1
+        heapq.heappush(self._sleepers, (self.now + seconds, self._count, wake))
+        _driver(loop).clocks[self] = None
+        await wake
+
+    def _wake_next(self) -> bool:
+        """Advance to the earliest deadline and wake everyone due; False if none."""
+        while self._sleepers and self._sleepers[0][2].done():  # cancelled sleepers
+            heapq.heappop(self._sleepers)
+        if not self._sleepers:
+            return False
+        deadline = self._sleepers[0][0]
+        self.now = max(self.now, deadline)
+        while self._sleepers and self._sleepers[0][0] <= deadline:
+            _, _, wake = heapq.heappop(self._sleepers)
+            if not wake.done():
+                wake.set_result(None)
+        return True
+
+
+class _Driver:
+    """One per event loop: when nothing else can run, every clock with sleepers advances.
+
+    A driver per clock would not work: each would count the others as runnable,
+    and time would never move.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.clocks: dict[SimClock, None] = {}  # in the order they first slept: deterministic
+        self._task = loop.create_task(self._run(loop))
+
+    def alive(self) -> bool:
+        return not self._task.done()
+
+    async def _run(self, loop: asyncio.AbstractEventLoop) -> None:
+        ready = getattr(loop, "_ready", None)  # CPython's queue of runnable callbacks
+        while self.clocks:
+            await asyncio.sleep(0)
+            if ready is None:  # another loop: give other tasks plenty of turns instead
+                for _ in range(64):
+                    await asyncio.sleep(0)
+            elif ready:
+                continue
+            self.clocks = {clock: None for clock in self.clocks if clock._wake_next()}
+
+
+_DRIVERS: dict[asyncio.AbstractEventLoop, _Driver] = {}
+
+
+def _driver(loop: asyncio.AbstractEventLoop) -> _Driver:
+    driver = _DRIVERS.get(loop)
+    if driver is None or not driver.alive():
+        for old in [old for old in _DRIVERS if old.is_closed()]:
+            del _DRIVERS[old]
+        driver = _DRIVERS[loop] = _Driver(loop)
+    return driver
+
+
 @dataclass(frozen=True, slots=True)
 class Chaos:
     """Random holds and uneven ticks, to shake out order and timing bugs."""
 
     seed: int
     max_hold: int = 64  # loop turns a request can wait on its way in or out
+    turn_s: float = 0.0005  # simulated seconds a held turn costs, so holds reorder ticks
     stall_chance: float = 0.1  # share of holds that are 16 times longer
     jitter: float = 1.0  # a tick can take up to 1 + jitter times as long
 
@@ -156,9 +253,10 @@ class MockBackend:
 
     def __init__(
         self,
-        cost: CostModel = GUESS,
+        cost: CostModel = A100,
         chaos: Chaos | None = None,
         scale: float = 0.0,
+        clock: SimClock | None = None,
     ) -> None:
         self._cost = cost
         self._chaos = chaos
@@ -171,31 +269,30 @@ class MockBackend:
         self._prefill_s = 0.0
         self._prm_lock = asyncio.Lock()
         self._scores = 0
-        self._simulated = 0.0
+        self._clock = clock or SimClock()
         self._started = time.perf_counter()
 
     def now(self) -> float:
         """Return simulated seconds since this backend was created."""
         if self._scale:
             return (time.perf_counter() - self._started) / self._scale
-        return self._simulated
+        return self._clock.now
 
     def advance_to(self, t: float) -> None:
         """Idle until simulated time t, as a rank does at a barrier.
 
-        Ranks in a run have one backend each, so their simulated clocks drift
+        Ranks in separate processes have a clock each, so their times drift
         apart; schedulers call this with the slowest rank's time when they meet.
-        Real time needs no help, so with scale>0 this does nothing.
+        Ranks sharing a SimClock, and real time with scale>0, need no help.
         """
         if not self._scale:
-            self._simulated = max(self._simulated, t)
+            self._clock.advance_to(t)
 
     async def _elapse(self, seconds: float) -> None:
         if self._scale:
             await asyncio.sleep(seconds * self._scale)
         else:
-            self._simulated += seconds
-            await asyncio.sleep(0)
+            await self._clock.sleep(seconds)
 
     async def _hold(self, key: str) -> None:
         if self._chaos is None:
@@ -206,6 +303,8 @@ class MockBackend:
             turns *= 16
         for _ in range(turns):
             await asyncio.sleep(0)
+        if not self._scale:
+            await self._clock.sleep(turns * self._chaos.turn_s)
 
     def _join(self, job: _Job, prefix: list[int]) -> None:
         self._prefill_s += self._cost.prefill(len(prefix) - self._gen_cache.cached(prefix))

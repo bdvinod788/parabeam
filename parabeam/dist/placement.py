@@ -11,7 +11,7 @@ the beam there first.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import NamedTuple
 
 Owner = int | None  # the rank holding a survivor; None if every rank does (the root)
@@ -44,10 +44,13 @@ def round_robin(units: Sequence[Unit], owners: Sequence[Owner], size: int) -> li
     return [i % size for i in range(len(units))]
 
 
-def keep_local(units: Sequence[Unit], owners: Sequence[Owner], size: int) -> list[int]:
+def keep_local(units: Sequence[Unit], owners: Sequence[Owner], size: int,
+               pinned: Collection[int] = ()) -> list[int]:
     """Keep units where their survivors are, then even out the load.
 
-    Each rank keeps its own units, best first, up to its share of the level's
+    A survivor's first unit stays with its owner if the survivor is pinned: the
+    async scheduler pins those whose children it has already started. Then each
+    rank keeps its own units, best first, up to its share of the level's
     expansions, rounded up. The rest go, in order, to the least-loaded rank.
     """
     share = -(-sum(unit.size for unit in units) // size)
@@ -55,6 +58,13 @@ def keep_local(units: Sequence[Unit], owners: Sequence[Owner], size: int) -> lis
     where: list[int | None] = [None] * len(units)
     for i, unit in enumerate(units):
         owner = owners[unit.survivor]
+        if unit.survivor in pinned and unit.start == 0 and owner is not None:
+            where[i] = owner
+            load[owner] += unit.size
+    for i, unit in enumerate(units):
+        owner = owners[unit.survivor]
+        if where[i] is not None:
+            continue
         if owner is not None and load[owner] + unit.size <= share:
             where[i] = owner
             load[owner] += unit.size

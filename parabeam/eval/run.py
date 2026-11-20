@@ -7,6 +7,8 @@
     python -m parabeam.eval.run levelsync --backend mock --local 4 --subset pilot --out runs/ls
     srun --mpi=pmix_v5 ... python -m parabeam.eval.run levelsync --subset weak --limit 20 \\
         --out runs/levelsync-p4   (slurm/levelsync.sbatch; each rank has its own servers)
+    python -m parabeam.eval.run async --backend mock --local 4 --cap 64 --out runs/as
+    srun ... python -m parabeam.eval.run async --cap 64 ... (slurm/levelsync.sbatch, PB_MODE=async)
 
 Each run directory gets a manifest.json and one JSON line per problem, written
 as the problem finishes, so a job that runs out of time loses nothing and a
@@ -52,7 +54,7 @@ def load_items(dataset: str, subset: str, mock: bool) -> tuple[list[Item], Item]
 
     if mock:
         ids = json.loads(SUBSETS_PATH.read_text())[dataset]["subsets"]
-        make = lambda i: Item(i, f"mock problem {i}", "0")  # noqa: E731
+        make = lambda i: Item(i, f"mock problem {i}", "0")
         return [make(i) for i in ids[subset]], make(ids["warmup"][0])
     items = [Item(e.id, e.question, e.answer, e.level) for e in load_subset(dataset, subset)]
     warm = load_subset(dataset, "warmup")[0]
@@ -168,7 +170,7 @@ def make_backend(args):
     if args.backend == "mock":
         from parabeam.backends.mock import MockBackend, mock_problem
 
-        backend = MockBackend()
+        backend = MockBackend(clock=getattr(args, "sim_clock", None))
         return backend, lambda item: mock_problem(item.id), backend.now
     from parabeam.backends.vllm_http import VllmBackend
 
@@ -245,23 +247,32 @@ async def run_serial(args) -> None:
 
 
 async def levelsync_rank(args, comm) -> int:
-    """One rank of a level-sync run; returns the exit status, the same on every rank.
+    """One rank of a level-sync or async run; returns the exit status, the same on every rank.
 
     Rank 0 writes the manifest, results.jsonl and summary.json. Every rank
     appends its own ranks/rank-<r>.jsonl: one line per problem and level, with
     phase times measured from a barrier at the problem's start, and each
-    request's token count, finish reason and duration.
+    request's token count, finish reason and duration. Level-sync lines have
+    five marks (move, generate, score, allgather, done); async lines have four
+    (move, work, work done, allgather done), since its scoring overlaps generation.
     """
-    from parabeam.dist import levelsync
+    from parabeam.dist import async_sched, levelsync
+
+    is_async = args.mode == "async"
+    opts = (async_sched.AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after)
+            if is_async else None)
 
     cfg = SearchConfig(args.N, args.M, args.max_depth, args.max_step_tokens)
     vllm = args.backend == "vllm"
     items, warmup = load_items(args.dataset, args.subset, not vllm)
     items = items[: args.limit] if args.limit else items
-    config = {"mode": "levelsync", "backend": args.backend, "dataset": args.dataset,
+    config = {"mode": args.mode, "backend": args.backend, "dataset": args.dataset,
               "subset": args.subset, "N": cfg.N, "M": cfg.M, "max_depth": cfg.max_depth,
               "max_step_tokens": cfg.max_step_tokens, "limit": args.limit, "P": comm.size,
               "placement": args.placement}
+    if is_async:
+        config.update({"cap": opts.cap, "steal": opts.steal, "early": opts.early,
+                       "early_after": opts.early_after})
     backend, to_problem, clock = make_backend(args)
     sync = getattr(backend, "advance_to", None) if not vllm else None
     me = {"rank": comm.rank, "host": socket.gethostname(),
@@ -299,6 +310,8 @@ async def levelsync_rank(args, comm) -> int:
         if sync is not None:
             sync(max(starts))
         t0 = clock()
+        if is_async:
+            return await async_sched.search(problem, cfg, backend, comm, opts, clock, sync), t0
         return await levelsync.search(problem, cfg, backend, comm, args.placement, clock,
                                       sync), t0
 
@@ -319,14 +332,19 @@ async def levelsync_rank(args, comm) -> int:
             with log_path.open("a") as log:
                 for s in run.ranks:
                     if s.rank == comm.rank:
-                        log.write(json.dumps({
+                        line = {
                             "id": item.id, "job": job, "rank": s.rank, "level": s.level,
                             "requests": s.requests, "gen_tokens": s.gen_tokens,
                             "moved_in": s.moved_in, "sent_bytes": s.sent_bytes,
                             "marks": [round(m - t0, 4) for m in s.marks],
                             "steps": [[st.tokens, st.finish, round(st.seconds, 4)]
                                       for st in s.steps],
-                        }) + "\n")
+                        }
+                        if is_async:
+                            line.update({"stolen": s.stolen, "given": s.given,
+                                         "early_started": s.early_started,
+                                         "early_kept": s.early_kept})
+                        log.write(json.dumps(line) + "\n")
             mine = (peak_kv if vllm else None, getattr(backend, "truncated", 0) - truncated,
                     getattr(backend, "retried", 0) - retried)
             every = await comm.allgather(mine)
@@ -351,7 +369,7 @@ async def levelsync_rank(args, comm) -> int:
                 "prm_s": sum(lv.prm_s for lv in result.levels),
                 "gen_tokens": sum(lv.gen_tokens for lv in result.levels),
                 "wait_s_mean": sum(s.wait_s for s in run.ranks) / comm.size,
-                "move_s_mean": sum(s.move_s for s in run.ranks) / comm.size,
+                "move_s_mean": sum(s.marks[1] - s.marks[0] for s in run.ranks) / comm.size,
                 "moved": sum(s.moved_in for s in run.ranks),
                 "sent_bytes": sum(s.sent_bytes for s in run.ranks),
                 "per_level": [[lv.level, lv.requests, round(lv.gen_s, 4), round(lv.prm_s, 4),
@@ -365,6 +383,9 @@ async def levelsync_rank(args, comm) -> int:
                 "retried": sum(r for _, _, r in every),
                 "job": job,
             }
+            if is_async:
+                record.update({key: sum(getattr(s, key) for s in run.ranks)
+                               for key in ("stolen", "early_started", "early_kept")})
             append(args.out, record)
             print(f"problem {item.id:>3}: {record['seconds']:7.1f} s, {record['levels']:>2} levels, "
                   f"wait {record['wait_s_mean']:6.1f} s, moved {record['moved']:>4}, "
@@ -379,8 +400,10 @@ async def levelsync_rank(args, comm) -> int:
 
 def run_levelsync(args) -> int:
     if args.local:
+        from parabeam.backends.mock import SimClock
         from parabeam.dist.runtime import run_local
 
+        args.sim_clock = SimClock()  # the ranks share a process, so they share time
         statuses = asyncio.run(run_local(args.local, lambda comm: levelsync_rank(args, comm)))
         return max(statuses)
     from parabeam.dist.runtime import MpiComm, abort_on_error
@@ -469,7 +492,7 @@ def summarize(out: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="mode", required=True)
-    for name in ("serial", "greedy", "levelsync"):
+    for name in ("serial", "greedy", "levelsync", "async"):
         p = sub.add_parser(name)
         p.add_argument("--out", type=Path, required=True)
         p.add_argument("--dataset", default="math500", choices=["math500", "gsm8k"])
@@ -477,7 +500,7 @@ def main() -> None:
         p.add_argument("--limit", type=int, help="run only the first problems of the subset")
         p.add_argument("--gen-url", default=os.environ.get("PB_GEN_URL"))
         p.add_argument("--prm-url", default=os.environ.get("PB_PRM_URL"))
-    for name in ("serial", "levelsync"):
+    for name in ("serial", "levelsync", "async"):
         p = sub.choices[name]
         p.add_argument("--backend", default="vllm", choices=["vllm", "mock"])
         p.add_argument("--N", type=int, default=256)
@@ -486,15 +509,24 @@ def main() -> None:
         p.add_argument("--max-step-tokens", type=int, default=2048)
     from parabeam.dist.placement import PLACEMENTS
 
-    levelsync = sub.choices["levelsync"]
-    levelsync.add_argument("--placement", default="keep_local", choices=sorted(PLACEMENTS))
-    levelsync.add_argument("--local", type=int, metavar="P",
-                           help="mock only: run P ranks in this process instead of over MPI")
+    for name in ("levelsync", "async"):
+        p = sub.choices[name]
+        p.add_argument("--local", type=int, metavar="P",
+                       help="mock only: run P ranks in this process instead of over MPI")
+    sub.choices["levelsync"].add_argument("--placement", default="keep_local",
+                                          choices=sorted(PLACEMENTS))
+    p = sub.choices["async"]
+    p.set_defaults(placement="keep_local")
+    p.add_argument("--cap", type=int, help="requests generating at once per rank (default: none)")
+    p.add_argument("--no-steal", action="store_true")
+    p.add_argument("--early", type=float, default=1.0,
+                   help="parents a rank may start early, in shares of N / (M * P); 0 for none")
+    p.add_argument("--early-after", type=float, default=0.5)
     args = parser.parse_args()
     needs_servers = args.mode == "greedy" or args.backend == "vllm"
     if needs_servers and not (args.gen_url and args.prm_url):
         parser.error("--gen-url and --prm-url (or PB_GEN_URL and PB_PRM_URL) are required")
-    if args.mode == "levelsync":
+    if args.mode in ("levelsync", "async"):
         if args.local and args.backend != "mock":
             parser.error("--local runs every rank in one process, so it needs --backend mock")
         sys.exit(run_levelsync(args))

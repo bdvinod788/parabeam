@@ -56,3 +56,16 @@ def test_it_draws_a_png(run_dir, tmp_path):
     lines = gantt.read_logs(run_dir, problem(run_dir))
     gantt.draw(lines, "test", tmp_path / "g.png")
     assert (tmp_path / "g.png").stat().st_size > 10_000
+
+
+def test_async_levels_have_three_phases(tmp_path):
+    argv = ["run", "async", "--backend", "mock", "--local", "2", "--subset", "pilot",
+            "--limit", "1", "--N", "16", "--cap", "4", "--out", str(tmp_path)]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit):
+            run.main()
+    lines = gantt.read_logs(tmp_path, problem(tmp_path))
+    spans = gantt.spans(lines)
+    assert len(spans) == 3 * len(lines)
+    assert {s.phase for s in spans} == {"move", "work", "wait"}

@@ -1,7 +1,7 @@
 #!/bin/bash
-# One level-sync rank, started by srun from slurm/levelsync.sbatch: start this
-# task's two vLLM servers on its own GPU, then run the rank with the arguments
-# given, which go to `python -m parabeam.eval.run levelsync`. MPI starts when
+# One rank, started by srun from slurm/levelsync.sbatch: start this task's two
+# vLLM servers on its own GPU, then run the rank with the arguments given, which
+# go to `python -m parabeam.eval.run $PB_MODE` (levelsync or async). MPI starts when
 # Python imports mpi4py, after the servers are up, so ranks whose servers start
 # quickly wait there for the slow ones.
 
@@ -30,7 +30,7 @@ echo "rank $rank on $(hostname), GPU $PB_GPU_UUID"
 
 trap pb_stop_servers EXIT
 pb_start_servers "logs/pb-levelsync-$job-r$rank" || exit 1
-python -m parabeam.eval.run levelsync "$@"
+python -m parabeam.eval.run "${PB_MODE:-levelsync}" "$@"
 status=$?
 echo "rank $rank finished at $(date -u +%FT%TZ) with status $status"
 exit "$status"

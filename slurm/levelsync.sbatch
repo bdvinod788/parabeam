@@ -8,7 +8,10 @@
 #
 # Slurm may spread the ranks over any nodes (each has two GPUs); add
 # --ntasks-per-node=2 to pack them. Settings, through --export=ALL,NAME=value:
-# PB_MODE (levelsync or async), PB_SUBSET (weak), PB_LIMIT (20), PB_N (256),
+# PB_MODE (levelsync or async), PB_DATASET (math500 or gsm8k), PB_SUBSET (weak
+# for math500, timing for gsm8k), PB_LIMIT (20), PB_N (256), PB_REPEAT (1; a
+# repeat writes to its own -r<k> directory, since a rerun of the same directory
+# only resumes),
 # PB_PLACEMENT (keep_local, level-sync only), PB_RUNS (~/parabeam/runs), and for
 # async PB_CAP (none), PB_EARLY (1.0), PB_STEAL (1), PB_SCORE (each or level).
 # Resubmitting the same
@@ -34,7 +37,17 @@ pb_modules $PB_MPI_MODULES || { echo "FAIL  could not load $PB_MPI_MODULES"; exi
 job="${SLURM_JOB_ID:-local}"
 P="${SLURM_NTASKS:-1}"
 runs="${PB_RUNS:-$HOME/parabeam/runs}"
-subset="${PB_SUBSET:-weak}"
+dataset="${PB_DATASET:-math500}"
+if [[ "$dataset" == math500 ]]; then
+    subset="${PB_SUBSET:-weak}"
+    prefix=""
+else
+    subset="${PB_SUBSET:-timing}"
+    prefix="$dataset-"
+fi
+repeat="${PB_REPEAT:-1}"
+suffix=""
+[[ "$repeat" != 1 ]] && suffix="-r$repeat"
 limit="${PB_LIMIT:-20}"
 n="${PB_N:-256}"
 mode="${PB_MODE:-levelsync}"
@@ -50,11 +63,11 @@ if [[ "$mode" == async ]]; then
         extra+=(--no-steal)
         steal="-nosteal"
     fi
-    out="$runs/async-$subset$limit-n$n-p$P-cap${cap:-none}-early$early-score$score$steal"
+    out="$runs/async-$prefix$subset$limit-n$n-p$P-cap${cap:-none}-early$early-score$score$steal$suffix"
 elif [[ "$mode" == levelsync ]]; then
     placement="${PB_PLACEMENT:-keep_local}"
     extra=(--placement "$placement")
-    out="$runs/levelsync-$subset$limit-n$n-p$P-$placement"
+    out="$runs/levelsync-$prefix$subset$limit-n$n-p$P-$placement$suffix"
 else
     echo "FAIL  PB_MODE must be levelsync or async, not '$mode'"
     exit 1
@@ -65,7 +78,8 @@ echo "started at $(date -u +%FT%TZ), writing $out"
 cat SNAPSHOT.json 2>/dev/null || git rev-parse HEAD
 
 srun --mpi=pmix_v5 --kill-on-bad-exit=1 bash slurm/levelsync_rank.sh \
-    --subset "$subset" --limit "$limit" --N "$n" --M 4 "${extra[@]}" --out "$out"
+    --dataset "$dataset" --subset "$subset" --limit "$limit" --N "$n" --M 4 "${extra[@]}" \
+    --out "$out"
 status=$?
 echo "finished at $(date -u +%FT%TZ) with status $status"
 exit "$status"

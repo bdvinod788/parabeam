@@ -171,3 +171,9 @@ def test_async_runs_match_serial_runs_and_log_their_counters(monkeypatch, tmp_pa
 def test_async_and_level_sync_runs_do_not_share_a_directory(monkeypatch, tmp_path):
     assert levelsync(monkeypatch, tmp_path) == 0
     assert run_async(monkeypatch, tmp_path) == 1  # other settings: refused
+
+
+def test_the_all_subset_is_the_whole_dataset_on_the_mock():
+    items, _ = run.load_items("math500", "all", mock=True)
+    assert [item.id for item in items] == list(range(500))
+    assert len(run.load_items("gsm8k", "all", mock=True)[0]) == 1319

@@ -16,6 +16,8 @@ SUBSETS_PATH = Path(__file__).with_name("subsets.json")
 MATH500_REPO = "HuggingFaceH4/MATH-500"
 MATH500_REVISION = "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be"
 GSM8K_REPO = "openai/gsm8k"
+ALL = "all"  # every problem, in dataset order, for accuracy runs
+SIZES = {"math500": 500, "gsm8k": 1319}
 GSM8K_REVISION = "740312add88f781978c0658806c59bc2815b9866"
 
 # Changing this changes every subset.
@@ -115,11 +117,13 @@ def build_subsets(math500: list[Example], gsm8k: list[Example]) -> dict:
 
 
 def load_subset(dataset: str, subset: str) -> list[Example]:
-    """Return one committed subset, or raise if the dataset no longer matches it."""
+    """Return one committed subset, or "all" of the dataset; raise if the data changed."""
     entry = json.loads(SUBSETS_PATH.read_text())[dataset]
     examples = {"math500": load_math500, "gsm8k": load_gsm8k}[dataset]()
     if fingerprint(examples) != entry["fingerprint"]:
         raise ValueError(f"{dataset} does not match the data subsets.json was built from")
+    if subset == ALL:
+        return examples
     return [examples[i] for i in entry["subsets"][subset]]
 
 

@@ -50,12 +50,13 @@ class Item:
 
 def load_items(dataset: str, subset: str, mock: bool) -> tuple[list[Item], Item]:
     """Return a subset and its warm-up problem. The mock needs only the IDs."""
-    from parabeam.eval.datasets import SUBSETS_PATH, load_subset
+    from parabeam.eval.datasets import ALL, SIZES, SUBSETS_PATH, load_subset
 
     if mock:
         ids = json.loads(SUBSETS_PATH.read_text())[dataset]["subsets"]
         make = lambda i: Item(i, f"mock problem {i}", "0")
-        return [make(i) for i in ids[subset]], make(ids["warmup"][0])
+        chosen = range(SIZES[dataset]) if subset == ALL else ids[subset]
+        return [make(i) for i in chosen], make(ids["warmup"][0])
     items = [Item(e.id, e.question, e.answer, e.level) for e in load_subset(dataset, subset)]
     warm = load_subset(dataset, "warmup")[0]
     return items, Item(warm.id, warm.question, warm.answer, warm.level)

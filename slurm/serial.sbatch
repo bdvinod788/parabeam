@@ -6,7 +6,10 @@
 #   sbatch --account=<project_id> --export=ALL,PB_N=64,PB_CALIBRATE=1,PB_GREEDY=1 slurm/serial.sbatch
 #
 # Results go to $PB_RUNS (default ~/parabeam/runs), one line per problem as it
-# finishes. Resubmitting the same command resumes where a job stopped.
+# finishes. Resubmitting the same command resumes where a job stopped. Other
+# settings: PB_DATASET (math500 or gsm8k), PB_SUBSET (weak, timing or all),
+# PB_LIMIT (the first problems only), PB_REPEAT (k > 1 writes its own -r<k>
+# directory, since a rerun of the same directory only resumes).
 #
 #SBATCH --job-name=pb-serial
 #SBATCH --partition=gpu
@@ -32,7 +35,18 @@ source slurm/launch_servers.sh
 
 job="${SLURM_JOB_ID:-local}"
 runs="${PB_RUNS:-$HOME/parabeam/runs}"
-subset="${PB_SUBSET:-weak}"
+dataset="${PB_DATASET:-math500}"
+if [[ "$dataset" == math500 ]]; then
+    subset="${PB_SUBSET:-weak}"
+    prefix=""
+else
+    subset="${PB_SUBSET:-timing}"
+    prefix="$dataset-"
+fi
+limit=()
+[[ -n "${PB_LIMIT:-}" ]] && limit=(--limit "$PB_LIMIT")
+suffix=""
+[[ "${PB_REPEAT:-1}" != 1 ]] && suffix="-r$PB_REPEAT"
 mkdir -p logs "$runs"
 echo "job $job on $(hostname) at $(date -u +%FT%TZ)"
 cat SNAPSHOT.json 2>/dev/null || git rev-parse HEAD
@@ -52,8 +66,8 @@ if [[ "${PB_GREEDY:-0}" == 1 ]]; then
     python -m parabeam.eval.run greedy --subset "$subset" --out "$runs/greedy-$subset" || status=1
 fi
 for n in ${PB_N:-256}; do
-    python -m parabeam.eval.run serial --subset "$subset" --N "$n" --M 4 \
-        --out "$runs/serial-$subset-n$n" || status=1
+    python -m parabeam.eval.run serial --dataset "$dataset" --subset "$subset" "${limit[@]}" \
+        --N "$n" --M 4 --out "$runs/serial-$prefix$subset${PB_LIMIT:-}-n$n$suffix" || status=1
 done
 echo "finished at $(date -u +%FT%TZ) with status $status"
 exit "$status"

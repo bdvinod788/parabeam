@@ -76,7 +76,23 @@ def keep_local(units: Sequence[Unit], owners: Sequence[Owner], size: int,
     return where  # type: ignore[return-value]
 
 
+def stay(units: Sequence[Unit], owners: Sequence[Owner], size: int,
+         pinned: Collection[int] = ()) -> list[int]:
+    """Leave every unit with its survivor's owner, however uneven; deal out the root's.
+
+    For the async scheduler, which evens out the load by stealing instead.
+    """
+    where, load = [], [0] * size
+    for unit in units:
+        owner = owners[unit.survivor]
+        rank = min(range(size), key=lambda r: (load[r], r)) if owner is None else owner
+        where.append(rank)
+        load[rank] += unit.size
+    return where
+
+
 PLACEMENTS: dict[str, Placement] = {"keep_local": keep_local, "round_robin": round_robin}
+ASYNC_PLACEMENTS = {"keep_local": keep_local, "stay": stay}  # these take pinned survivors
 
 
 def check_placement(units: Sequence[Unit], where: Sequence[int], size: int) -> None:

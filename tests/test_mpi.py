@@ -74,3 +74,10 @@ def test_async_matches_serial_over_mpi(ranks, extra):
     done = launch(ranks, "-m", "parabeam.dist.async_sched", "--limit", "2", "--N", "16", *extra)
     assert done.returncode == 0, done.stdout + done.stderr
     assert f"2 of 2 match the serial search, P={ranks}" in done.stdout
+
+
+def test_both_kinds_of_stealing_match_serial_over_mpi():
+    done = launch(4, "-m", "parabeam.dist.async_sched", "--limit", "3", "--N", "64", "--cap", "16",
+                  "--score", "level", "--placement", "stay", "--early-steal", "--tail", "2")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "3 of 3 match the serial search, P=4" in done.stdout

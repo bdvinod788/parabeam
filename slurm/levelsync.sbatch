@@ -13,7 +13,8 @@
 # repeat writes to its own -r<k> directory, since a rerun of the same directory
 # only resumes),
 # PB_PLACEMENT (keep_local, level-sync only), PB_RUNS (~/parabeam/runs), and for
-# async PB_CAP (none), PB_EARLY (1.0), PB_STEAL (1), PB_SCORE (each or level).
+# async PB_CAP (none), PB_EARLY (1.0), PB_STEAL (1), PB_SCORE (each or level),
+# PB_PLACEMENT (keep_local or stay), PB_EARLY_STEAL (0) and PB_TAIL (0).
 # Resubmitting the same
 # command resumes.
 #
@@ -62,6 +63,18 @@ if [[ "$mode" == async ]]; then
     if [[ "${PB_STEAL:-1}" == 0 ]]; then
         extra+=(--no-steal)
         steal="-nosteal"
+    fi
+    if [[ "${PB_PLACEMENT:-keep_local}" != keep_local ]]; then
+        extra+=(--placement "$PB_PLACEMENT")
+        steal+="-$PB_PLACEMENT"
+    fi
+    if [[ "${PB_EARLY_STEAL:-0}" == 1 ]]; then
+        extra+=(--early-steal)
+        steal+="-earlysteal"
+    fi
+    if [[ "${PB_TAIL:-0}" != 0 ]]; then
+        extra+=(--tail "$PB_TAIL")
+        steal+="-tail$PB_TAIL"
     fi
     out="$runs/async-$prefix$subset$limit-n$n-p$P-cap${cap:-none}-early$early-score$score$steal$suffix"
 elif [[ "$mode" == levelsync ]]; then

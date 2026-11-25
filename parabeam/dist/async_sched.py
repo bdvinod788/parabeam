@@ -7,20 +7,30 @@ level, in three parts that can be switched off one at a time for the ablation:
 
 - Scoring overlaps generation (score="each"). Each child is scored as soon as it
   is generated, in one PRM call with whatever else finished while the PRM was
-  busy, instead of all together after the level's longest step. On a GPU that
-  also runs the generator this costs more than it saves: in job 14398026 decode
-  steps ran about 4.4 times slower while the PRM scored, so async at P = 1 took
-  4.02 s per level against level-sync's 2.73. With score="level" a rank scores
-  its children of a level in one call once they are all generated, as level-sync
+  busy, instead of all together after the level's longest step. In its one GPU
+  run (job 14398026: P = 1, cap 64) this took 4.02 s per level against level-sync's
+  2.73. The two models slowing each other on one GPU is the likely cause, but it
+  was not isolated from the cap or from the many small PRM calls. With
+  score="level" a rank scores its children of a level in one call once they are
+  all generated, as level-sync
   does, and keeps the other two parts.
 - Stealing. Work waits in a rank-local queue with at most `cap` requests
-  generating at once. A rank with nothing queued asks the others in turn and
-  takes half of a queue, its worst-ranked units first, parents included.
+  generating at once. A rank with nothing queued and free slots asks the rank
+  that started the level with the longest queue, then the next, and takes as
+  many units as it can start, worst-ranked first, parents included. With
+  placement="stay" survivors are not rebalanced before a level, so stealing is
+  what evens out the load; a cap of N / P then queues only the overflow.
 - Early starts. Child i of a parent is the same request however many children
   the parent ends up with, and every survivor gets at least M. So a rank with
   free slots starts the first M children of its best-scored beams before
   selection. It reports which parents it started, placement keeps their first
   units where they are, and the children of parents that lose are aborted.
+- Early stealing (early_steal=True). Ranks tell each other their scores as soon as
+  they have them. A rank drops early starts that can no longer be among the top
+  N / M, and uses the slots for likely survivors of ranks that hold more than
+  their share, which hand over the parent. So the likely survivors are spread
+  while ranks wait, with no cap needed. A rank still waiting for a long step can
+  score what it has once at most `tail` requests are left, and join in.
 
     python -m parabeam.dist.async_sched --local 4 --subset pilot
     mpiexec -n 4 python -m parabeam.dist.async_sched --subset pilot
@@ -51,8 +61,8 @@ from parabeam.core.seeding import Path
 from parabeam.core.select import Scored, child_counts, select_top
 from parabeam.core.serial import LevelStats, SearchResult, candidate_digest
 from parabeam.dist.levelsync import Candidate, Step, _move
-from parabeam.dist.placement import Owner, check_placement, keep_local, make_units
-from parabeam.dist.runtime import GIVE, STEAL, Comm
+from parabeam.dist.placement import ASYNC_PLACEMENTS, Owner, check_placement, make_units
+from parabeam.dist.runtime import EARLY, GIVE, HAND, SCORES, STEAL, Comm
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +72,9 @@ class AsyncOptions:
     early: float = 1.0  # parents a rank may start early, in shares of N / (M * P); 0 for none
     early_after: float = 0.5  # share of its own children scored before a rank starts early
     score: str = "each"  # "each": as children finish; "level": once a rank's level is generated
+    placement: str = "keep_local"  # or "stay": leave survivors where they are, and let stealing act
+    early_steal: bool = False  # start early the likely survivors of other ranks; needs score="level"
+    tail: int = 0  # with score="level", score early once this few requests are left; 0 to wait
 
     def __post_init__(self) -> None:
         if self.score not in ("each", "level"):
@@ -70,6 +83,12 @@ class AsyncOptions:
             raise ValueError(f"cap must be positive, got {self.cap}")
         if self.early < 0 or not 0 <= self.early_after <= 1:
             raise ValueError("early must be at least 0 and early_after in [0, 1]")
+        if self.placement not in ASYNC_PLACEMENTS:
+            raise ValueError(f"placement must be one of {sorted(ASYNC_PLACEMENTS)}")
+        if (self.early_steal or self.tail) and self.score != "level":
+            raise ValueError("early_steal and tail need score='level'")
+        if self.early_steal and self.early <= 0:
+            raise ValueError("early_steal needs early starts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +104,7 @@ class AsyncRankLevel:
     given: int  # units others took from this rank
     early_started: int  # children of the next level started before selection
     early_kept: int  # of those, children whose parent survived
+    early_taken: int  # parents started early here that another rank scored
     sent_bytes: int
     # When the rank began moving beams, began the level's work, finished it, and
     # left the allgather. Work for the next level can run between the last two.
@@ -182,6 +202,13 @@ class _Rank:
     early: dict[Path, list[asyncio.Task[_Child]]] = field(default_factory=dict)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     opened: dict[int, asyncio.Event] = field(default_factory=dict)  # by level
+    # Early stealing, for the current level:
+    scored: dict[Path, Beam] = field(default_factory=dict)  # this rank's, as they are scored
+    handed: set[Path] = field(default_factory=set)  # given to another rank to start
+    foreign: dict[Path, Beam] = field(default_factory=dict)  # taken from another rank
+    known: dict[int, dict[int, tuple[int, list[Scored]]]] = field(default_factory=dict)
+    news: asyncio.Event = field(default_factory=asyncio.Event)
+    sending: set[asyncio.Task] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.scorer = _Scorer(self.backend)
@@ -237,33 +264,33 @@ class _Rank:
         answering: set[asyncio.Task[None]] = set()
         try:
             while True:
-                thief, level = await self.comm.recv(STEAL)
-                task = asyncio.ensure_future(self._answer(thief, level))
+                thief, (level, want) = await self.comm.recv(STEAL)
+                task = asyncio.ensure_future(self._answer(thief, level, want))
                 answering.add(task)
                 task.add_done_callback(answering.discard)
         finally:
             for task in answering:
                 task.cancel()
 
-    async def _answer(self, thief: int, level: int) -> None:
-        """Give half the queue, worst units first. A thief can reach a level before this
+    async def _answer(self, thief: int, level: int, want: int) -> None:
+        """Give up to `want` units, worst first. A thief can reach a level before this
         rank has opened it, so the answer waits for that rather than having it ask again."""
         await self._opened(level).wait()
         if self.level > level or not self.queue:
             reply = (level, "empty", [])
         else:
-            take = -(-len(self.queue) // 2)
-            works = [self.queue.pop() for _ in range(take)][::-1]
+            works = [self.queue.pop() for _ in range(min(want, len(self.queue)))][::-1]
             self.given += len(works)
             reply = (level, "gave", works)
         await self.comm.send(reply, thief, GIVE)
 
-    async def _steal(self, level: int, empty: set[int]) -> int:
+    async def _steal(self, level: int, victims: Sequence[int], empty: set[int]) -> int:
         """Ask each rank not known to be empty once; return how many units arrived."""
-        for victim in [(self.comm.rank + i) % self.comm.size for i in range(1, self.comm.size)]:
+        for victim in victims:
             if victim in empty:
                 continue
-            await self.comm.send(level, victim, STEAL)
+            want = max(1, min(self._free(), self.cfg.N) // self.cfg.M)
+            await self.comm.send((level, want), victim, STEAL)
             source, (for_level, status, works) = await self.comm.recv(GIVE)
             if source != victim or for_level != level:
                 raise RuntimeError(f"rank {self.comm.rank} asked {victim} for level {level} "
@@ -303,9 +330,110 @@ class _Rank:
             del self.early[parent]
         return kept
 
+    # Early stealing ---------------------------------------------------------
+
+    def _budget(self) -> int:
+        return math.ceil(self.opts.early * self.cfg.survivors / self.comm.size)
+
+    def _publish(self, level: int, children: dict[Path, Beam]) -> None:
+        """Tell every rank this rank's scores so far for a level."""
+        self.scored = children
+        mine = (len(children), [Scored(b.score, b.path) for b in children.values()
+                                if not is_finished(b, self.cfg)])
+        self.known.setdefault(level, {})[self.comm.rank] = mine
+        self.news.set()
+        for dest in range(self.comm.size):
+            if dest != self.comm.rank:
+                task = asyncio.ensure_future(
+                    self.comm.send((self.problem.id, level, mine), dest, SCORES))
+                self.sending.add(task)
+                task.add_done_callback(self.sending.discard)
+
+    async def listen(self) -> None:
+        """Collect the other ranks' scores. Another problem's are dropped."""
+        while True:
+            source, (problem, level, scores) = await self.comm.recv(SCORES)
+            if problem == self.problem.id and level >= self.level:
+                self.known.setdefault(level, {})[source] = scores
+                self.news.set()
+
+    def _likely(self, level: int) -> set[Path]:
+        """Which scored beams would survive, judging by every score known so far."""
+        known = self.known.get(level, {}).values()
+        share = sum(count for count, _ in known) / self.cfg.N
+        return {s.path for s in select_top((s for _, scores in known for s in scores),
+                                           math.ceil(self.cfg.survivors * share))}
+
+    def _spare(self, level: int, rank: int) -> list[Scored]:
+        """A rank's likely survivors beyond its own budget, best first."""
+        likely = self._likely(level)
+        scores = self.known.get(level, {}).get(rank, (0, []))[1]
+        mine = sorted((s for s in scores if s.path in likely), key=lambda s: (-s.score, s.path))
+        return mine[self._budget():]
+
+    async def hand(self) -> None:
+        """Answer requests for likely survivors, at once, for the whole problem."""
+        while True:
+            thief, (level, want) = await self.comm.recv(EARLY)
+            beams = []
+            if level == self.level and level in self.known:
+                spare = [s.path for s in self._spare(level, self.comm.rank)]
+                free = [p for p in spare if p in self.scored and p not in self.early
+                        and p not in self.handed]
+                beams = [self.scored[p] for p in free[:want]]
+                self.handed.update(b.path for b in beams)
+            await self.comm.send((level, beams), thief, HAND)
+
+    async def speculate(self, level: int, stop: asyncio.Event) -> None:
+        """Keep the early starts to likely survivors, taking other ranks' spare ones, until
+        the level is decided. One request is out at a time, and it is always answered."""
+        budget, dry = self._budget(), set()
+        while not stop.is_set():
+            self.news.clear()
+            if level in self.known and self.comm.rank in self.known[level]:
+                likely = self._likely(level)
+                for parent in [p for p in self.early if p not in likely]:
+                    self._cancel(parent)
+                own = sorted((b for p, b in self.scored.items() if p in likely
+                              and p not in self.early and p not in self.handed),
+                             key=lambda b: (-b.score, b.path))
+                for beam in own:
+                    if len(self.early) >= budget or self._free() < self.cfg.M:
+                        break
+                    self.early[beam.path] = self._start(_Work(beam, 0, self.cfg.M))
+                room = min(budget - len(self.early), self._free() // self.cfg.M)
+                spare = {r: len(self._spare(level, r)) for r in self.known[level]
+                         if r != self.comm.rank and (r, len(self.known[level])) not in dry}
+                victim = max(spare, key=lambda r: (spare[r], -r), default=None)
+                if room > 0 and victim is not None and spare[victim] > 0:
+                    asked = (victim, len(self.known[level]))
+                    await self.comm.send((level, min(room, spare[victim])), victim, EARLY)
+                    _, (for_level, beams) = await self.comm.recv(HAND)
+                    if for_level != level:
+                        raise RuntimeError(f"asked for level {level}, heard about {for_level}")
+                    if not beams:
+                        dry.add(asked)
+                    for beam in beams:
+                        self.foreign[beam.path] = beam
+                        self.early[beam.path] = self._start(_Work(beam, 0, self.cfg.M))
+                    continue
+            waits = [asyncio.ensure_future(self.news.wait()), asyncio.ensure_future(stop.wait())]
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            for wait in waits:
+                wait.cancel()
+
+    def _cancel(self, parent: Path) -> None:
+        for task in self.early.pop(parent):
+            task.cancel()
+            task.add_done_callback(_quiet)
+
+    async def _score(self, beams: list[Beam]) -> dict[Path, Beam]:
+        scores = await self.backend.score([b.prm_ids for b in beams])
+        return {b.path: b.scored(x) for b, x in zip(beams, scores, strict=True)}
+
     # One level --------------------------------------------------------------
 
-    async def work(self, level: int, mine: list[_Work]) -> tuple[
+    async def work(self, level: int, mine: list[_Work], victims: Sequence[int]) -> tuple[
             dict[Path, Beam], list[Step], int, int]:
         """Generate and score this rank's children of a level, stealing when idle.
 
@@ -320,9 +448,13 @@ class _Rank:
             else:
                 self.queue.append(work)
         self.level = level  # with the queue in place, steal requests see both together
+        self.scored, self.handed, self.foreign = {}, set(), {}
+        self.known = {k: v for k, v in self.known.items() if k >= level}
         self._opened(level).set()
         own = sum(work.size for work in mine)
-        budget = math.ceil(self.opts.early * self.cfg.survivors / self.comm.size)
+        budget = self._budget()
+        done: dict[Path, Beam] = {}  # scored before the rest, by a tail call
+        tail_call: asyncio.Task | None = None
         early_ok = self.opts.early > 0 and level < self.cfg.max_depth
         children: dict[Path, Beam] = {}
         steps: list[Step] = []
@@ -336,8 +468,8 @@ class _Rank:
                 children[beam.path] = beam
                 steps.append(step)
             can_start = self._free() >= self.cfg.M or self.generating == 0
-            if not self.queue and self.opts.steal and can_start and len(empty) < self.comm.size - 1:
-                got = await self._steal(level, empty)
+            if not self.queue and self.opts.steal and can_start and len(empty) < len(victims):
+                got = await self._steal(level, victims, empty)
                 if got:
                     stolen += got
                     continue
@@ -346,16 +478,29 @@ class _Rank:
                 self._start_early(children, budget)
             if not tasks:
                 break
+            if self.opts.tail and tail_call is None and children and not self.queue \
+                    and len(tasks) <= self.opts.tail:
+                tail_call = asyncio.ensure_future(self._score(list(children.values())))
+            if tail_call is not None and tail_call.done() and not done:
+                done = tail_call.result()
+                if early_ok and self.opts.early_steal:
+                    self._publish(level, dict(done))
+                elif early_ok:
+                    self._start_early(done, budget)
             self.changed.clear()
             waiter = asyncio.ensure_future(self.changed.wait())
-            await asyncio.wait({*tasks, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            scoring = {tail_call} if tail_call is not None and not tail_call.done() else set()
+            await asyncio.wait({*tasks, waiter, *scoring}, return_when=asyncio.FIRST_COMPLETED)
             waiter.cancel()
+        if tail_call is not None:
+            done = await tail_call
         if self.opts.score == "level" and children:
-            # Nothing of this rank's is generating now, so the PRM has the GPU to itself.
-            beams = list(children.values())
-            scores = await self.backend.score([b.prm_ids for b in beams])
-            children = {b.path: b.scored(x) for b, x in zip(beams, scores, strict=True)}
-        if early_ok:
+            # Unless early starts are already running here, the PRM has the GPU to itself.
+            rest = [b for path, b in children.items() if path not in done]
+            children = {**done, **(await self._score(rest) if rest else {})}
+        if early_ok and self.opts.early_steal:
+            self._publish(level, children)
+        elif early_ok:
             self._start_early(children, budget)  # every child is scored now: top up
         return children, steps, stolen, sum(len(t) for t in self.early.values())
 
@@ -378,7 +523,10 @@ async def search(
         return [payload for payload, _ in reports]
 
     rank = _Rank(problem, cfg, opts, backend, comm, clock)
-    server = asyncio.ensure_future(rank.serve())
+    servers = [asyncio.ensure_future(rank.serve())]
+    if opts.early_steal:
+        servers += [asyncio.ensure_future(rank.listen()), asyncio.ensure_future(rank.hand())]
+    speculator: asyncio.Task | None = None
     try:
         start = clock()
         survivors: list[Path] = [()]
@@ -393,14 +541,23 @@ async def search(
         while survivors:
             level = len(survivors[0]) + 1
             units = make_units(child_counts(len(survivors), cfg.N), cfg.M)
-            where = keep_local(units, owners, comm.size, pinned)
+            where = ASYNC_PLACEMENTS[opts.placement](units, owners, comm.size, pinned)
             check_placement(units, where, comm.size)
             sent_before, given_before, moving = comm.sent_bytes, rank.given, clock()
             moved_in = await _move(comm, level, units, where, owners, survivors, held)
             begin = clock()
             work = [_Work(held[survivors[u.survivor]], u.start, u.stop)
                     for u, dest in zip(units, where, strict=True) if dest == comm.rank]
-            children, steps, stolen, early_started = await rank.work(level, work)
+            load = [0] * comm.size
+            for unit, dest in zip(units, where, strict=True):
+                load[dest] += unit.size
+            victims = sorted((r for r in range(comm.size) if r != comm.rank),
+                             key=lambda r: (-load[r], (r - comm.rank) % comm.size))
+            stop = asyncio.Event()
+            if opts.early_steal and level < cfg.max_depth:
+                rank.level = level  # its speculator and servers act on this level from here
+                speculator = asyncio.ensure_future(rank.speculate(level, stop))
+            children, steps, stolen, early_started = await rank.work(level, work, victims)
             done_at = clock()
 
             report = ([Candidate(c.path, c.score, is_finished(c, cfg)) for c in children.values()],
@@ -411,22 +568,35 @@ async def search(
                     unit.size for unit in units):
                 raise RuntimeError(f"level {level} lost or repeated beams")
             owner_of = {c.path: r for r, (cands, _) in enumerate(reports) for c in cands}
-            started = {path for _, early in reports for path in early}
+            starters = {path: r for r, (_, early) in enumerate(reports) for path in early}
+            if opts.early_steal:
+                # Early starts went on until every score was in; now settle who started what.
+                stop.set()
+                if speculator is not None:
+                    await speculator
+                    speculator = None
+                early_started = sum(len(t) for t in rank.early.values())
+                lists = await gather(sorted(rank.early))
+                starters = {path: r for r, early in enumerate(lists) for path in early}
+                if len(starters) != sum(len(early) for early in lists):
+                    raise RuntimeError(f"level {level}: two ranks started the same parent early")
+            taken = len(rank.foreign)
             top = select_top((Scored(c.score, c.path) for c in candidates if not c.finished),
                              cfg.survivors)
             survivors = [c.path for c in top]
-            owners = [owner_of[path] for path in survivors]
-            pinned = {i for i, path in enumerate(survivors) if path in started}
+            owners = [starters.get(path, owner_of[path]) for path in survivors]
+            pinned = {i for i, path in enumerate(survivors) if path in starters}
             keep = set(survivors)
             early_kept = rank._abort_early(keep)
-            held = {path: beam for path, beam in children.items() if path in keep}
+            held = {path: beam for path, beam in {**children, **rank.foreign}.items()
+                    if path in keep}
             finished.extend(b for b in children.values() if is_finished(b, cfg))
             kept.append(tuple(survivors))
             digests.append(candidate_digest(Scored(c.score, c.path) for c in candidates))
             gathered_at = clock()
             mine.append(AsyncRankLevel(
                 comm.rank, level, len(children), sum(s.tokens for s in steps), moved_in,
-                stolen, rank.given - given_before, early_started, early_kept,
+                stolen, rank.given - given_before, early_started, early_kept, taken,
                 comm.sent_bytes - sent_before, (moving, begin, done_at, gathered_at),
                 tuple(steps)))
 
@@ -434,10 +604,14 @@ async def search(
         # server can go now. Stopping it before the final gather matters: once that
         # returns, a fast rank starts the next problem and may ask this one for work,
         # and a server still running would take the request and never answer it.
-        await _stop(server)
+        if rank.sending:
+            await asyncio.gather(*rank.sending)
+        for server in servers:
+            await _stop(server)
         gathered = await gather((finished, mine))
     finally:
-        await _stop(server)
+        for task in [*servers, *([speculator] if speculator is not None else [])]:
+            await _stop(task)
         rank._abort_early(set())
     every = sorted((s for _, stats in gathered for s in stats), key=lambda s: (s.level, s.rank))
     return AsyncResult(
@@ -502,11 +676,15 @@ def main() -> None:
     parser.add_argument("--early", type=float, default=1.0)
     parser.add_argument("--early-after", type=float, default=0.5)
     parser.add_argument("--score", default="each", choices=["each", "level"])
+    parser.add_argument("--placement", default="keep_local", choices=sorted(ASYNC_PLACEMENTS))
+    parser.add_argument("--early-steal", action="store_true")
+    parser.add_argument("--tail", type=int, default=0)
     parser.add_argument("--chaos", type=int, help="seed for chaos timing and delivery")
     args = parser.parse_args()
 
     cfg = SearchConfig(args.N, args.M, args.max_depth, args.max_step_tokens)
-    opts = AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after, args.score)
+    opts = AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after, args.score,
+                        args.placement, args.early_steal, args.tail)
     ids = json.loads(SUBSETS_PATH.read_text())["math500"]["subsets"][args.subset][: args.limit]
 
     def line(problem_id: int, run: AsyncResult, serial: SearchResult) -> tuple[bool, str]:
@@ -518,6 +696,7 @@ def main() -> None:
             f"problem {problem_id:>3}: {len(run.result.levels):>2} levels, "
             f"{run.result.seconds:7.1f} s simulated vs {serial.seconds:7.1f} s serial "
             f"({serial.seconds / run.result.seconds:4.2f}x), stolen {sum(s.stolen for s in r):>3}, "
+            f"taken {sum(s.early_taken for s in r):>3}, "
             f"early {sum(s.early_kept for s in r):>4}/{sum(s.early_started for s in r):>4} kept, "
             f"{'match' if same else 'MISMATCH'}")
 

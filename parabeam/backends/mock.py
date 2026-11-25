@@ -25,7 +25,9 @@ import asyncio
 import hashlib
 import heapq
 import json
+import math
 import random
+import statistics
 import time
 from array import array
 from dataclasses import dataclass
@@ -41,6 +43,12 @@ LEVEL_STEPS: list[list[int]] = _STATS["level_steps"]  # one distribution per log
 PROBLEM_STEPS: list[int] = _STATS["problem_steps"]
 STOP_SPREAD: int = _STATS["stop_spread"]
 
+# Fitted on Nov 24 to the level-sync GPU run at N = 256, P = 4 (beams moved per level
+# 13.9, barrier wait 24%). On runs it was not fitted to it is rougher: at P = 2 it
+# moves about 20% too many beams, and at N = 1,024 it waits 9% against the GPU's 15%.
+SCORE_RHO = 0.99  # how much of a step's quality comes from its parent
+LENGTH_RHO = 0.9  # correlation of siblings' step lengths
+_NORMAL = statistics.NormalDist()
 EXTRA_0 = 1 << 20  # above every mock token, which fit in 16 bits
 ANSWERS = 4  # distinct answers, so that votes are contested
 FINAL_STEPS = 5  # the last level generates to EOS, a few steps at once
@@ -58,8 +66,19 @@ def level_steps(problem_id: int, level: int) -> list[int]:
     return LEVEL_STEPS[int(_draw(problem_id * 1000 + level, "level") * len(LEVEL_STEPS))]
 
 
-def _step_length(seed: int, salt: str, steps: list[int]) -> int:
-    return steps[int(_draw(seed, salt) * len(steps))]
+def _step_length(seed: int, salt: str, steps: list[int], parent: str) -> int:
+    """Draw a length from the level's steps; siblings' lengths are alike.
+
+    A Gaussian copula: LENGTH_RHO of the draw is shared by every child of a
+    parent, and the level's distribution is unchanged. Without it long steps
+    spread evenly over ranks, and ranks wait far less than on the GPU.
+    """
+    own = _NORMAL.inv_cdf(_draw(seed, salt) * (1 - 2e-12) + 1e-12)
+    if LENGTH_RHO:
+        digest = hashlib.sha256(f"length:{parent}".encode()).digest()
+        shared = _NORMAL.inv_cdf((int.from_bytes(digest[:6], "big") + 0.5) / 2**48)
+        own = math.sqrt(LENGTH_RHO) * shared + math.sqrt(1 - LENGTH_RHO) * own
+    return steps[min(len(steps) - 1, int(_NORMAL.cdf(own) * len(steps)))]
 
 
 def stop_chance(problem_id: int, level: int) -> float:
@@ -77,14 +96,15 @@ def stop_chance(problem_id: int, level: int) -> float:
 def mock_step(req: GenReq) -> tuple[list[int], str, Finish]:
     """Return the tokens, text and finish reason of a request."""
     seed = req.seed
-    problem_key, level_key, _ = req.beam_id.split("/")
+    problem_key, level_key, path_key_ = req.beam_id.split("/")
+    parent = f"{problem_key}/{path_key_.rpartition('-')[0]}"
     problem, level = int(problem_key.removeprefix("p")), int(level_key.removeprefix("L"))
     steps = level_steps(problem, level)
     if req.final:
-        length = sum(_step_length(seed, f"length{i}", steps) for i in range(FINAL_STEPS))
+        length = sum(_step_length(seed, f"length{i}", steps, parent) for i in range(FINAL_STEPS))
         stop = True
     else:
-        length = _step_length(seed, "length", steps)
+        length = _step_length(seed, "length", steps, parent)
         stop = _draw(seed, "stop") < stop_chance(problem, level)
 
     if length > req.max_tokens:
@@ -99,9 +119,26 @@ def mock_step(req: GenReq) -> tuple[list[int], str, Finish]:
 
 
 def mock_score(prm_ids: list[int]) -> float:
-    """Return a reward in [0, 1) fixed by the IDs, which identify the path."""
-    digest = hashlib.sha256(array("Q", prm_ids).tobytes()).digest()
-    return int.from_bytes(digest[:8], "big") / 2**64
+    """Return a reward in (0, 1) fixed by the IDs, which identify the path.
+
+    Good parents have good children: each step's quality is SCORE_RHO of its
+    parent's plus fresh noise drawn from the IDs up to it, and the reward is that
+    quality's quantile, so rewards stay uniform. Independent rewards would spread
+    the survivors evenly over the ranks, which hides the imbalance that placement
+    and stealing exist to fix.
+    """
+    digest = hashlib.sha256()
+    quality, start, first = 0.0, 0, True
+    ends = [i + 1 for i, token in enumerate(prm_ids) if token == EXTRA_0] or [len(prm_ids)]
+    for end in ends:
+        digest.update(array("Q", prm_ids[start:end]).tobytes())
+        start = end
+        draw = (int.from_bytes(digest.copy().digest()[:6], "big") + 0.5) / 2**48
+        noise = _NORMAL.inv_cdf(draw)
+        quality = noise if first else (
+            SCORE_RHO * quality + math.sqrt(1 - SCORE_RHO**2) * noise)
+        first = False
+    return _NORMAL.cdf(quality)
 
 
 def mock_problem(problem_id: int) -> Problem:

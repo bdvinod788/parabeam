@@ -261,7 +261,8 @@ async def levelsync_rank(args, comm) -> int:
 
     is_async = args.mode == "async"
     opts = (async_sched.AsyncOptions(args.cap, not args.no_steal, args.early, args.early_after,
-                                     args.score) if is_async else None)
+                                     args.score, args.placement, args.early_steal, args.tail)
+            if is_async else None)
 
     cfg = SearchConfig(args.N, args.M, args.max_depth, args.max_step_tokens)
     vllm = args.backend == "vllm"
@@ -273,7 +274,8 @@ async def levelsync_rank(args, comm) -> int:
               "placement": args.placement}
     if is_async:
         config.update({"cap": opts.cap, "steal": opts.steal, "early": opts.early,
-                       "early_after": opts.early_after, "score": opts.score})
+                       "early_after": opts.early_after, "score": opts.score,
+                       "early_steal": opts.early_steal, "tail": opts.tail})
     backend, to_problem, clock = make_backend(args)
     sync = getattr(backend, "advance_to", None) if not vllm else None
     me = {"rank": comm.rank, "host": socket.gethostname(),
@@ -344,7 +346,8 @@ async def levelsync_rank(args, comm) -> int:
                         if is_async:
                             line.update({"stolen": s.stolen, "given": s.given,
                                          "early_started": s.early_started,
-                                         "early_kept": s.early_kept})
+                                         "early_kept": s.early_kept,
+                                         "early_taken": s.early_taken})
                         log.write(json.dumps(line) + "\n")
             mine = (peak_kv if vllm else None, getattr(backend, "truncated", 0) - truncated,
                     getattr(backend, "retried", 0) - retried)
@@ -386,7 +389,8 @@ async def levelsync_rank(args, comm) -> int:
             }
             if is_async:
                 record.update({key: sum(getattr(s, key) for s in run.ranks)
-                               for key in ("stolen", "early_started", "early_kept")})
+                               for key in ("stolen", "early_started", "early_kept",
+                                           "early_taken")})
             append(args.out, record)
             print(f"problem {item.id:>3}: {record['seconds']:7.1f} s, {record['levels']:>2} levels, "
                   f"wait {record['wait_s_mean']:6.1f} s, moved {record['moved']:>4}, "
@@ -508,7 +512,7 @@ def main() -> None:
         p.add_argument("--M", type=int, default=4)
         p.add_argument("--max-depth", type=int, default=40)
         p.add_argument("--max-step-tokens", type=int, default=2048)
-    from parabeam.dist.placement import PLACEMENTS
+    from parabeam.dist.placement import ASYNC_PLACEMENTS, PLACEMENTS
 
     for name in ("levelsync", "async"):
         p = sub.choices[name]
@@ -517,7 +521,11 @@ def main() -> None:
     sub.choices["levelsync"].add_argument("--placement", default="keep_local",
                                           choices=sorted(PLACEMENTS))
     p = sub.choices["async"]
-    p.set_defaults(placement="keep_local")
+    p.add_argument("--placement", default="keep_local", choices=sorted(ASYNC_PLACEMENTS))
+    p.add_argument("--early-steal", action="store_true",
+                   help="start early the likely survivors of other ranks (needs --score level)")
+    p.add_argument("--tail", type=int, default=0,
+                   help="with --score level, score early once this few requests are left")
     p.add_argument("--cap", type=int, help="requests generating at once per rank (default: none)")
     p.add_argument("--no-steal", action="store_true")
     p.add_argument("--early", type=float, default=1.0,

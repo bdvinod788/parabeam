@@ -22,6 +22,12 @@ OPTIONS = {
     "all, no cap, eager": AsyncOptions(early=2.0, early_after=0.0),
     "level scoring": AsyncOptions(steal=False, early=0, score="level"),
     "level scoring, all, cap 4": AsyncOptions(cap=4, early=1.0, score="level"),
+    "stay and steal": AsyncOptions(cap=4, early=0, score="level", placement="stay"),
+    "stay, no stealing": AsyncOptions(steal=False, early=0, score="level", placement="stay"),
+    "early steal": AsyncOptions(steal=False, early=1.0, score="level", early_steal=True),
+    "early steal, tail": AsyncOptions(steal=False, score="level", early_steal=True, tail=2),
+    "tail only": AsyncOptions(steal=False, score="level", tail=2),
+    "everything": AsyncOptions(cap=8, score="level", placement="stay", early_steal=True, tail=2),
 }
 
 
@@ -161,6 +167,35 @@ def test_scoring_while_generating_costs_time_on_a_shared_gpu():
     assert each > level_sync_seconds(17, 1, cfg)
 
 
+def total(opts, name, ranks=4, problems=(17, 462, 22), chaos=None):
+    runs = [spread(p, ranks, opts, chaos, cfg=replace(CFG, N=256))[0] for p in problems]
+    return sum(getattr(s, name) for run in runs for s in run.ranks)
+
+
+def test_survivors_left_in_place_are_balanced_by_real_steals():
+    cfg = replace(CFG, N=256)
+    opts = AsyncOptions(cap=64, early=0, score="level", placement="stay")
+    assert total(opts, "moved_in") == 0
+    assert total(opts, "stolen") > 50
+    alone = replace(opts, cap=None, steal=False)
+    balanced = sum(spread(p, 4, opts, cfg=cfg)[0].result.seconds for p in (17, 462, 22))
+    uneven = sum(spread(p, 4, alone, cfg=cfg)[0].result.seconds for p in (17, 462, 22))
+    assert balanced < uneven
+
+
+def test_likely_survivors_are_taken_from_ranks_that_hold_too_many():
+    opts = AsyncOptions(steal=False, score="level", early_steal=True)
+    assert total(opts, "early_taken") > 20
+    assert total(replace(opts, early_steal=False), "early_taken") == 0
+
+
+@pytest.mark.parametrize("chaos", [0, 1, 2, 3])
+def test_early_stealing_under_chaos_at_n256(chaos):
+    cfg = replace(CFG, N=256)
+    opts = AsyncOptions(cap=64, score="level", placement="stay", early_steal=True, tail=4)
+    assert fingerprint(spread(22, 4, opts, chaos, cfg)[0].result) == fingerprint(serial(22, cfg))
+
+
 def test_options_are_checked():
     with pytest.raises(ValueError):
         AsyncOptions(cap=0)
@@ -170,3 +205,7 @@ def test_options_are_checked():
         AsyncOptions(early_after=2)
     with pytest.raises(ValueError):
         AsyncOptions(score="sometimes")
+    with pytest.raises(ValueError):
+        AsyncOptions(placement="nowhere")
+    with pytest.raises(ValueError):
+        AsyncOptions(early_steal=True)  # needs whole-level scoring

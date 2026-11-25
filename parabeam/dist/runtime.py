@@ -34,6 +34,9 @@ POLL_S = 0.001  # how often a waiting rank polls MPI
 MOVE = 1  # tag: beams sent to the rank that expands them
 STEAL = 2  # tag: an idle rank asks another for queued work
 GIVE = 3  # tag: the answer to STEAL
+SCORES = 4  # tag: a rank's scored children, so others can tell which are likely to survive
+EARLY = 5  # tag: an idle rank asks for a likely survivor to start early
+HAND = 6  # tag: the answer to EARLY
 
 
 class Comm(Protocol):
